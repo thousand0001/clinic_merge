@@ -41,7 +41,7 @@ from odf.opendocument import load as load_ods_document
 from odf.table import Table, TableRow, TableCell
 from odf.text import P
 from openpyxl.styles import Border, Side, Alignment, Font, PatternFill
-from openpyxl.utils import column_index_from_string
+from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.exceptions import InvalidFileException
 
 warnings.filterwarnings(
@@ -65,12 +65,10 @@ _LEFT_COLS  = frozenset([39, 40, 41, 48, 49])   # AM, AN, AO, AV, AW
 
 _FONT_14    = Font(size=14)
 _FONT_24    = Font(size=24)
-_ALIGN_LEFT   = Alignment(horizontal='left',   vertical='center', wrap_text=True)
-_ALIGN_CENTER = Alignment(horizontal='center', vertical='center', wrap_text=True)
-_ALIGN_CHECK  = Alignment(horizontal='center', vertical='center')  # safe_set_check 共用
 _TZ_TW = datetime.timezone(datetime.timedelta(hours=8))  # 台灣時區，模組層級共用
 _FILL_SCREENING_NOT_NEEDED = PatternFill(fill_type="solid", fgColor="FFF200")
 _FILL_SCREENING_PENDING = PatternFill(fill_type="solid", fgColor="F4CCCC")
+_FILL_NONE = PatternFill(fill_type=None)
 _FILL_DOCTOR_LAB_FAIL = PatternFill(fill_type="solid", fgColor="FFC000")
 _FILL_DOCTOR_DATE_DONE = PatternFill(fill_type="solid", fgColor="C6E0B4")
 _BORDER_THIN_GRAY = Border(
@@ -79,6 +77,16 @@ _BORDER_THIN_GRAY = Border(
     top=Side(style="thin", color="B7B7B7"),
     bottom=Side(style="thin", color="B7B7B7"),
 )
+_ALIGNMENT_CACHE: Dict[Tuple[str, bool], Alignment] = {}
+
+
+def _get_alignment(horizontal: str, wrap_text: bool = False) -> Alignment:
+    key = (horizontal, wrap_text)
+    cached = _ALIGNMENT_CACHE.get(key)
+    if cached is None:
+        cached = Alignment(horizontal=horizontal, vertical="center", wrap_text=wrap_text)
+        _ALIGNMENT_CACHE[key] = cached
+    return cached
 
 
 def _apply_member_row_style(ws, row: int, max_col: int) -> None:
@@ -86,10 +94,8 @@ def _apply_member_row_style(ws, row: int, max_col: int) -> None:
         cell = ws.cell(row, c)
         if c in _LEFT_COLS:
             cell.font      = _FONT_14
-            cell.alignment = _ALIGN_LEFT
         else:
             cell.font      = _FONT_24
-            cell.alignment = _ALIGN_CENTER
 
 
 SUMMARY_CELLS = {
@@ -223,24 +229,24 @@ class Rules:
     AW_OFFSET_DAYS: int = 56
 
     # 模板設定（0327）
-    TEMPLATE_NAME: str = "選會員樣板0401.xlsx"
+    TEMPLATE_NAME: str = "選會員模板0407.xlsx"
     SHEET_TARGET: str = "會員總表"
     DATA_START_ROW: int = 3
 
     # 月份申請統計輸出欄位（0325）
     # L=114全年件數, M=114實際申報總額(1-4月), N=115件數(1-4月), O=115實際申報總額(1-4月)
     COL_114_COUNT: str = "L"
-    COL_114_COUNT_FULL: str = "BB"   # 隱藏輔助欄：114全年件數
     COL_115_COUNT: str = "N"
     COL_114_AMOUNT: str = "M"
     COL_115_AMOUNT: str = "O"
-    COL_114_AMOUNT_TOTAL: str = "BC"  # 隱藏輔助欄：114總金額
-    COL_115_AMOUNT_TOTAL: str = "BD"  # 隱藏輔助欄：115總金額
-    COL_ADDRESS_HIDDEN: str = "BE"    # 隱藏輔助欄：地址
-    COL_IS_114: str = "AX"
-    COL_IS_SELF_SELECT: str = "AY"
-    COL_IS_115X: str = "AZ"
-    COL_NOTE: str = "AW"
+    COL_114_COUNT_Q1_HIDDEN: str = "BG"  # 隱藏輔助欄：114年1-4月就診次數
+    COL_114_AMOUNT_TOTAL: str = "BD"  # 隱藏輔助欄：114總金額
+    COL_115_AMOUNT_TOTAL: str = "BE"  # 隱藏輔助欄：115總金額
+    COL_ADDRESS_HIDDEN: str = "BF"    # 隱藏輔助欄：地址
+    COL_IS_114: str = "AZ"
+    COL_IS_SELF_SELECT: str = "BA"
+    COL_IS_115X: str = "BB"
+    COL_NOTE: str = "AY"
 
 
 
@@ -395,12 +401,11 @@ def safe_set(ws, row: int, col: Optional[int], value: Any) -> None:
 
 
 def safe_set_check(ws, row: int, col: Optional[int], value: Any) -> None:
-    """寫入打勾符號並置中對齊"""
+    """寫入打勾符號"""
     if col:
         cell = ws.cell(row, col)
-        cell.value = value
-        if value is not None:
-            cell.alignment = _ALIGN_CHECK
+        normalized_value = "✔" if value == "v" else value
+        cell.value = normalized_value
 
 
 def calc_age(bday: Optional[datetime.date], ref: datetime.date) -> int:
@@ -1191,7 +1196,7 @@ def fill_monthly_claim_summary_columns(
 ) -> None:
     col_last = cols.get("last_visit")            # K：最後就診日
     col_m    = cols.get("m_count_114")            # L：114全年件數
-    col_n_fy = cols.get("m_count_114_full")       # BB：114全年件數（輔助）
+    col_n_q1 = cols.get("m_count_114_q1")         # BG：114件數（1-4月，輔助）
     col_o    = cols.get("n_count_115")            # N：115件數（1-4月）
     col_s    = cols.get("r_amount_114")           # M：114實際申報總額（1-4月）
     col_t    = cols.get("s_amount_115")           # O：115實際申報總額（1-4月）
@@ -1209,8 +1214,8 @@ def fill_monthly_claim_summary_columns(
             if col_last:
                 ws.cell(rr, col_last).value = None
             ws.cell(rr, col_m).value = None
-            if col_n_fy:
-                ws.cell(rr, col_n_fy).value = None
+            if col_n_q1:
+                ws.cell(rr, col_n_q1).value = None
             ws.cell(rr, col_o).value = None
             ws.cell(rr, col_s).value = None
             ws.cell(rr, col_t).value = None
@@ -1234,8 +1239,8 @@ def fill_monthly_claim_summary_columns(
                 datetime.date.fromordinal(last_visit_ord) if last_visit_ord > 0 else None
             )
         ws.cell(rr, col_m).value = _to_excel_number(v114c_fy) if v114c_fy != 0 else None
-        if col_n_fy:
-            ws.cell(rr, col_n_fy).value = _to_excel_number(v114c_fy) if v114c_fy != 0 else None
+        if col_n_q1:
+            ws.cell(rr, col_n_q1).value = _to_excel_number(v114c) if v114c != 0 else None
         ws.cell(rr, col_o).value = _to_excel_number(v115c) if v115c != 0 else None
         ws.cell(rr, col_s).value = _to_excel_int(v114a) if v114a != 0 else None
         ws.cell(rr, col_t).value = _to_excel_int(v115a) if v115a != 0 else None
@@ -1442,7 +1447,8 @@ def _detect_output_cols(ws, header_row: int, max_scan_row: int) -> Dict[str, Opt
         "score": (kw(ws, header_row, ["分數"])),
         "breakdown": (kw(ws, header_row, ["分數說明"])
                         or kw_any(ws, max_scan_row, ["分數說明"])),
-        "note":  (kw(ws, header_row, ["備註"])),
+        "note":  (kw(ws, header_row, ["預防保健提醒"])
+                  or kw(ws, header_row, ["備註"])),
         # AK：合併大區塊，用 1~data_start-1 掃描
         "ak":    (kw_any(ws, max_scan_row, ["打勾"])
                   or kw_any(ws, max_scan_row, ["HbA1c", "打勾"])
@@ -1452,6 +1458,8 @@ def _detect_output_cols(ws, header_row: int, max_scan_row: int) -> Dict[str, Opt
                      or kw_any(ws, max_scan_row, ["LDL", "合格"])),
         "uacr_pass": (kw(ws, header_row, ["UACR", "合格"])
                       or kw_any(ws, max_scan_row, ["UACR", "合格"])),
+        "metabolic_enroll": (kw(ws, header_row, ["可納入新陳代謝收案"])
+                             or kw_any(ws, max_scan_row, ["可納入新陳代謝收案"])),
         # AX：漏檢項目
         "ax":    (kw_any(ws, max_scan_row, ["漏檢項目"])
                   or kw_any(ws, max_scan_row, ["漏檢"])
@@ -1475,6 +1483,7 @@ def _detect_output_cols(ws, header_row: int, max_scan_row: int) -> Dict[str, Opt
         "is_self_select": kw(ws, header_row, ["是否為自選會員"]),
         "is_115x":        kw(ws, header_row, ["是否為115X"]),
         "m_count_114":    kw(ws, header_row, ["114年", "就診次數"]),
+        "m_count_114_q1": kw(ws, header_row, ["114年1-4月就診次數"]),
         "n_count_115":    kw(ws, header_row, ["115年", "就診次數"]),
         "r_amount_114":   (kw(ws, header_row, ["114年", "實際申報總額"])
                            or kw(ws, header_row, ["114年", "申報總額"])
@@ -1482,7 +1491,6 @@ def _detect_output_cols(ws, header_row: int, max_scan_row: int) -> Dict[str, Opt
         "s_amount_115":   (kw(ws, header_row, ["115年", "實際申報總額"])
                            or kw(ws, header_row, ["115年", "申報總額"])
                            or kw(ws, header_row, ["115年", "申報金額", "月"])),
-        "m_count_114_full": kw(ws, header_row, ["114年全年就診次數"]),
         "r_amount_114_total": kw(ws, header_row, ["114年申報總金額"]),
         "s_amount_115_total": kw(ws, header_row, ["115年申報總金額"]),
         "address_hidden": kw(ws, header_row, ["地址"]),
@@ -1553,7 +1561,7 @@ def detect_template_columns(ws, data_start: int) -> Dict[str, Optional[int]]:
         "disease_text", "score", "breakdown", "note",
         "au", "av", "aw",
         "ak", "ldl_pass", "uacr_pass", "ax",
-        "m_count_114", "m_count_114_full", "n_count_115", "r_amount_114", "s_amount_115",
+        "m_count_114", "n_count_115", "r_amount_114", "s_amount_115",
         "ay_mark", "az_mark", "bb_mark", "bc_mark",
     ])
     return cols
@@ -1651,7 +1659,7 @@ def should_check_ldl_pass(
 ) -> bool:
     """
     LDL 合格規則：
-    - 正常人（疾病樣態分類空白）：LDL < 100
+    - 正常人（疾病樣態分類空白）：LDL <= 130
     - ASCVD a：LDL < 55
     - ASCVD b：LDL < 70
     - DM / DKD：LDL < 100
@@ -1671,7 +1679,7 @@ def should_check_ldl_pass(
     if token == "b":
         return v < 70.0
     if is_normal:
-        return v < 100.0
+        return v <= 130.0
     if has_dm:
         return v < 100.0
     if has_ckd:
@@ -2380,8 +2388,6 @@ def _copy_sheet_rows(
         (src_col_map.get(src_key), column_index_from_string(dst_letter))
         for src_key, dst_letter in col_map
     ]
-    _center_align = Alignment(horizontal="center", vertical="center")
-
     dst_row = dst_data_start
     for src_row in range(data_start, last_row + 1):
         # 過濾 ID
@@ -2393,17 +2399,34 @@ def _copy_sheet_rows(
         for src_c, dst_c in _col_pairs:
             if src_c:
                 val = ws_main.cell(src_row, src_c).value
+                normalized_val = "✔" if val == "v" else val
                 cell = ws_out.cell(dst_row, dst_c)
-                cell.value = val
-                existing_alignment = copy(cell.alignment)
-                existing_alignment.vertical = "center"
-                cell.alignment = existing_alignment
-                if val == "v":
-                    cell.alignment = _center_align
+                cell.value = normalized_val
         dst_row += 1
 
     ws_out.sheet_view.showGridLines = True
     return dst_row - dst_data_start
+
+
+def _apply_vertical_center_to_sheet(
+    ws,
+    *,
+    start_row: int = 1,
+    end_row: Optional[int] = None,
+    start_col: int = 1,
+    end_col: Optional[int] = None,
+) -> None:
+    align_cache: Dict[int, Alignment] = {}
+    end_row = end_row or ws.max_row
+    end_col = end_col or ws.max_column
+    for row in ws.iter_rows(min_row=start_row, max_row=end_row, min_col=start_col, max_col=end_col):
+        for cell in row:
+            cached_alignment = align_cache.get(cell.style_id)
+            if cached_alignment is None:
+                cached_alignment = copy(cell.alignment)
+                cached_alignment.vertical = "center"
+                align_cache[cell.style_id] = cached_alignment
+            cell.alignment = cached_alignment
 
 
 SELF_SELECT_SHEET_NAME = "自選名單(從會員指標內容Key過來)"
@@ -2417,34 +2440,39 @@ _DOCTOR_COL_MAP: List[Tuple[str, str]] = [
     ("id", "A"),
     ("name", "B"),
     ("bday", "C"),
-    ("tel", "D"),
-    ("mobile", "E"),
-    ("dx_raw", "F"),
-    ("dmk_code", "G"),
-    ("ascvd", "H"),
-    ("last_visit", "I"),
-    ("m_count_114_full", "J"),
+    ("tel", "E"),
+    ("mobile", "F"),
+    ("dx_raw", "G"),
+    ("dmk_code", "H"),
+    ("ascvd", "I"),
+    ("last_visit", "J"),
     ("m_count_114", "K"),
-    ("n_count_115", "L"),
-    ("r_amount_114_total", "M"),
-    ("s_amount_115_total", "N"),
-    ("adult", "O"),
-    ("pap", "P"),
-    ("flu", "Q"),
-    ("fit", "R"),
-    ("hep", "S"),
-    ("hba", "T"),
-    ("hba_dt", "U"),
-    ("ldl", "V"),
-    ("ldl_dt", "W"),
-    ("p4p_status", "X"),
-    ("p4p_enroll_dt", "Y"),
-    ("p4p_last_dt", "Z"),
-    ("p4p_next_dt", "AA"),
-    ("is_115x", "AB"),
-    ("is_self_select", "AC"),
-    ("is_114", "AD"),
-    ("score", "AE"),
+    ("m_count_114_q1", "L"),
+    ("n_count_115", "M"),
+    ("r_amount_114_total", "N"),
+    ("s_amount_115_total", "O"),
+    ("adult", "P"),
+    ("pap", "Q"),
+    ("flu", "R"),
+    ("fit", "S"),
+    ("hep", "T"),
+    ("hba", "U"),
+    ("hba_dt", "V"),
+    ("ldl", "W"),
+    ("ldl_dt", "X"),
+    ("uacr", "Y"),
+    ("uacr_dt", "Z"),
+    ("main_sub_dx", "AA"),
+    ("p4p_status", "AB"),
+    ("p4p_enroll_dt", "AC"),
+    ("p4p_last_dt", "AD"),
+    ("p4p_next_dt", "AE"),
+    ("is_115x", "AF"),
+    ("is_self_select", "AG"),
+    ("is_114", "AH"),
+    ("score", "AI"),
+    ("breakdown", "AN"),
+    ("note", "AO"),
 ]
 
 
@@ -2487,7 +2515,7 @@ def _doctor_screening_status(
 
     if needed:
         return "待受檢", _FILL_SCREENING_PENDING
-    return "不需受檢", _FILL_SCREENING_NOT_NEEDED
+    return "不需受檢", _FILL_NONE
 
 
 def _doctor_screening_is_overdue(
@@ -2521,6 +2549,9 @@ def _doctor_lab_status(
     e_code: Optional[DiseaseCode],
     ascvd_raw: Any,
 ) -> Tuple[str, PatternFill]:
+    if e_code is None and normalize_text(ascvd_raw) == "":
+        return "", _FILL_NONE
+
     has_dm = e_code in (DiseaseCode.DM, DiseaseCode.DKD)
     has_ckd = e_code in (DiseaseCode.CKD, DiseaseCode.DKD)
     has_ascvd = parse_ascvd(ascvd_raw) != AscvdCategory.NONE
@@ -2534,7 +2565,96 @@ def _doctor_lab_status(
 
     if needed:
         return "待受檢", _FILL_SCREENING_PENDING
-    return "不需受檢", _FILL_SCREENING_NOT_NEEDED
+    return "不需受檢", _FILL_NONE
+
+
+def _doctor_lab_needed_by_disease(
+    kind: str,
+    *,
+    e_code: Optional[DiseaseCode],
+    ascvd_raw: Any,
+) -> bool:
+    has_dm = e_code in (DiseaseCode.DM, DiseaseCode.DKD)
+    has_ckd = e_code in (DiseaseCode.CKD, DiseaseCode.DKD)
+    has_ascvd = parse_ascvd(ascvd_raw) != AscvdCategory.NONE
+
+    if kind == "hba":
+        return has_dm
+    if kind == "ldl":
+        return has_dm or has_ckd or has_ascvd
+    return False
+
+
+def _doctor_lab_has_target(
+    kind: str,
+    *,
+    e_code: Optional[DiseaseCode],
+    ascvd_raw: Any,
+) -> bool:
+    if kind == "hba":
+        return e_code in (DiseaseCode.DM, DiseaseCode.DKD) or _is_normal_person_by_group(
+            e_code, parse_ascvd(ascvd_raw)
+        )
+    if kind == "ldl":
+        return (
+            e_code in (DiseaseCode.DM, DiseaseCode.CKD, DiseaseCode.DKD)
+            or _is_normal_person_by_group(e_code, parse_ascvd(ascvd_raw))
+            or _ascvd_token(ascvd_raw) in ("a", "b")
+        )
+    return False
+
+
+def _doctor_date_text(dt_value: Any) -> Optional[str]:
+    dt = parse_date(dt_value)
+    if dt is None:
+        return None
+    return dt.strftime("%Y-%m-%d")
+
+
+def _doctor_dmk_display(e_code: Optional[DiseaseCode], raw_value: Any) -> Any:
+    if e_code == DiseaseCode.DM:
+        return "DM"
+    if e_code == DiseaseCode.CKD:
+        return "CKD"
+    if e_code == DiseaseCode.DKD:
+        return "DKD"
+    if e_code == DiseaseCode.OTHER:
+        return "None"
+    return raw_value
+
+
+def _doctor_ascvd_display(raw_value: Any) -> Any:
+    value = clean_spaces(raw_value).lower()
+    if value == "0":
+        return "0"
+    if value in ("1", "a"):
+        return "ASCVD-a"
+    if value == "b":
+        return "ASCVD-b"
+    return raw_value
+
+
+def _doctor_cell_alignment(col_letter: str, value: Any) -> Alignment:
+    if col_letter in {"G", "AN", "AO"}:
+        return _get_alignment("left", wrap_text=True)
+
+    text = "" if value is None else str(value)
+    if col_letter in {"P", "Q", "R", "S", "T", "Y"}:
+        return _get_alignment("center", wrap_text=bool(text))
+    if col_letter in {"U", "W"}:
+        return _get_alignment("center", wrap_text="\n" in text)
+    if col_letter in {"V", "X"}:
+        return _get_alignment("center", wrap_text=text in ("待受檢", "不需受檢"))
+    return _get_alignment("center", wrap_text=False)
+
+
+def _finalize_doctor_sheet_alignment(ws_doc) -> None:
+    end_col = column_index_from_string("AO")
+    for row in range(4, ws_doc.max_row + 1):
+        for col in range(1, end_col + 1):
+            cell = ws_doc.cell(row, col)
+            col_letter = get_column_letter(col)
+            cell.alignment = _doctor_cell_alignment(col_letter, cell.value)
 
 
 def populate_doctor_sheet(
@@ -2549,9 +2669,17 @@ def populate_doctor_sheet(
         return
     src_col_map = _build_src_col_map(_DOCTOR_COL_MAP, cols)
     ws_doc = wb_tpl[DOCTOR_SHEET_NAME]
-    n = _copy_sheet_rows(ws_main, ws_doc, _DOCTOR_COL_MAP, src_col_map, data_start, last_row)
+    n = _copy_sheet_rows(
+        ws_main,
+        ws_doc,
+        _DOCTOR_COL_MAP,
+        src_col_map,
+        data_start,
+        last_row,
+        dst_data_start=4,
+    )
     today = today or datetime.date.today()
-    for col_letter in ("O", "P", "Q", "R", "S"):
+    for col_letter in ("P", "Q", "R", "S", "T"):
         ws_doc.column_dimensions[col_letter].width = max(
             ws_doc.column_dimensions[col_letter].width or 0,
             18,
@@ -2560,91 +2688,162 @@ def populate_doctor_sheet(
     breakdown_col = cols.get("breakdown")
     age_col = cols.get("age")
     sex_col = cols.get("sex")
+    abc_col = cols.get("abc")
+    disease_text_col = cols.get("disease_text")
     hba_pass_col = cols.get("ak")
     ldl_pass_col = cols.get("ldl_pass")
-    right_align = Alignment(horizontal="right", vertical="center")
-    center_align_wrap = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    center_align_no_wrap = Alignment(horizontal="center", vertical="center")
-    for offset, src_row in enumerate(range(data_start, last_row + 1), start=3):
+    uacr_pass_col = cols.get("uacr_pass")
+    leak_item_col = cols.get("ax")
+    doctor_alert_font = Font(bold=True, color="FF0000")
+    for offset, src_row in enumerate(range(data_start, last_row + 1), start=4):
         visit_score = fee_score = exam_score = prevention_score = None
         if breakdown_col:
             visit_score, fee_score, exam_score, prevention_score = _extract_score_components(
                 ws_main.cell(src_row, breakdown_col).value
             )
-        e_code = parse_disease_code(ws_main.cell(src_row, cols["dmk_code"]).value)
+        raw_dmk_value = ws_main.cell(src_row, cols["dmk_code"]).value
+        e_code = parse_disease_code(raw_dmk_value)
         ascvd_raw = ws_main.cell(src_row, cols["ascvd"]).value
         age_val = ws_main.cell(src_row, age_col).value if age_col else None
         sex_val = normalize_text(ws_main.cell(src_row, sex_col).value) if sex_col else ""
-        ws_doc[f"AF{offset}"] = visit_score
-        ws_doc[f"AG{offset}"] = fee_score
-        ws_doc[f"AH{offset}"] = exam_score
-        ws_doc[f"AI{offset}"] = prevention_score
-        ws_doc[f"AJ{offset}"] = age_val
-        for col_letter in ("AF", "AG", "AH", "AI", "AJ"):
-            ws_doc[f"{col_letter}{offset}"].alignment = right_align
+        abc_val = normalize_text(ws_main.cell(src_row, abc_col).value) if abc_col else ""
+        disease_text_val = normalize_text(ws_main.cell(src_row, disease_text_col).value) if disease_text_col else ""
+        leak_item_val = normalize_text(ws_main.cell(src_row, leak_item_col).value) if leak_item_col else ""
+        ws_doc[f"D{offset}"] = age_val
+        ws_doc[f"H{offset}"] = _doctor_dmk_display(e_code, raw_dmk_value)
+        ws_doc[f"I{offset}"] = _doctor_ascvd_display(ascvd_raw)
+        ws_doc[f"AJ{offset}"] = visit_score
+        ws_doc[f"AK{offset}"] = fee_score
+        ws_doc[f"AL{offset}"] = exam_score
+        ws_doc[f"AM{offset}"] = prevention_score
 
         age_num = _safe_int(age_val)
         for col_letter, kind in (
-            ("O", "adult"),
-            ("P", "pap"),
-            ("Q", "flu"),
-            ("R", "fit"),
-            ("S", "hep"),
+            ("P", "adult"),
+            ("Q", "pap"),
+            ("R", "flu"),
+            ("S", "fit"),
+            ("T", "hep"),
         ):
             cell = ws_doc[f"{col_letter}{offset}"]
             dt = parse_date(cell.value)
             if dt is not None:
                 if _doctor_screening_is_overdue(kind, dt=dt, age=age_num, sex=sex_val, today=today):
                     cell.value = f"{dt.strftime('%Y-%m-%d')}\n(過期待受檢)"
-                    cell.fill = _FILL_SCREENING_PENDING
-                    cell.alignment = center_align_wrap
-                else:
-                    cell.alignment = center_align_no_wrap
+                    cell.fill = _FILL_SCREENING_NOT_NEEDED
                 continue
             if cell.value not in (None, ""):
-                cell.alignment = center_align_no_wrap
                 continue
             status_text, status_fill = _doctor_screening_status(kind, age=age_num, sex=sex_val)
             cell.value = status_text
             cell.fill = status_fill
-            cell.alignment = center_align_wrap
             cell.border = _BORDER_THIN_GRAY
             continue
 
-        for col_letter in ("O", "P", "Q", "R", "S"):
+        for col_letter in ("P", "Q", "R", "S", "T"):
             ws_doc[f"{col_letter}{offset}"].border = _BORDER_THIN_GRAY
 
-        for col_letter, kind in (("U", "hba"), ("W", "ldl")):
+        for col_letter, kind in (("V", "hba"), ("X", "ldl")):
             cell = ws_doc[f"{col_letter}{offset}"]
             dt = parse_date(cell.value)
+            status_text, status_fill = _doctor_lab_status(kind, e_code=e_code, ascvd_raw=ascvd_raw)
             if dt is not None:
+                if status_text == "不需受檢":
+                    cell.value = f"{dt.strftime('%Y-%m-%d')}\n(不需受檢)"
                 if dt.year == Rules.SCREEN_YEAR:
                     cell.fill = _FILL_DOCTOR_DATE_DONE
-                cell.alignment = center_align_no_wrap
                 cell.border = _BORDER_THIN_GRAY
                 continue
             if cell.value not in (None, ""):
-                cell.alignment = center_align_no_wrap
                 cell.border = _BORDER_THIN_GRAY
                 continue
-            status_text, status_fill = _doctor_lab_status(kind, e_code=e_code, ascvd_raw=ascvd_raw)
             cell.value = status_text
             cell.fill = status_fill
-            cell.alignment = center_align_wrap
             cell.border = _BORDER_THIN_GRAY
 
-        for col_letter, pass_col in (("T", hba_pass_col), ("V", ldl_pass_col)):
+        for col_letter, kind, pass_col in (("U", "hba", hba_pass_col), ("W", "ldl", ldl_pass_col)):
             cell = ws_doc[f"{col_letter}{offset}"]
             cell.border = _BORDER_THIN_GRAY
-            cell.alignment = right_align
+            cell.font = copy(cell.font)
+            date_col_letter = "V" if col_letter == "U" else "X"
+            date_cell_value = ws_doc[f"{date_col_letter}{offset}"].value
+            date_val = parse_date(date_cell_value)
+            needs_check = _doctor_lab_has_target(kind, e_code=e_code, ascvd_raw=ascvd_raw)
+            needs_check_by_disease = _doctor_lab_needed_by_disease(kind, e_code=e_code, ascvd_raw=ascvd_raw)
+            is_unknown_group = e_code is None and normalize_text(ascvd_raw) == ""
+            is_other_without_ascvd = e_code == DiseaseCode.OTHER and _ascvd_token(ascvd_raw) == "0"
+
+            if (col_letter == "U" and leak_item_val == "HbA1c漏檢") or (col_letter == "W" and leak_item_val == "LDL漏檢"):
+                display_val = normalize_text(cell.value)
+                if display_val:
+                    cell.value = f"{display_val}\n(2026年漏檢)"
+                else:
+                    cell.value = "(2026年漏檢)"
+                cell.fill = _FILL_NONE
+                cell.font = doctor_alert_font
+                continue
+
+            if needs_check_by_disease and (date_val is None or date_val.year != Rules.SCREEN_YEAR):
+                display_val = normalize_text(cell.value)
+                if display_val and display_val not in ("待受檢", "不需受檢"):
+                    cell.value = f"{display_val}\n(2026需受檢)"
+                else:
+                    cell.value = "(2026需受檢)"
+                cell.fill = _FILL_NONE
+                cell.font = doctor_alert_font
+                continue
 
             lab_val = parse_float(cell.value)
             if lab_val is None:
                 continue
 
+            if not needs_check:
+                cell.fill = _FILL_NONE
+                continue
+
             pass_mark = normalize_text(ws_main.cell(src_row, pass_col).value) if pass_col else ""
             if pass_mark != "✔":
-                cell.fill = _FILL_DOCTOR_LAB_FAIL
+                cell.fill = _FILL_NONE
+                if is_unknown_group or is_other_without_ascvd:
+                    display_val = str(int(lab_val)) if float(lab_val).is_integer() else str(lab_val)
+                    cell.value = f"{display_val}\n(已受檢未達控制)"
+                    cell.font = doctor_alert_font
+                elif date_val is not None and date_val.year == Rules.SCREEN_YEAR:
+                    display_val = str(int(lab_val)) if float(lab_val).is_integer() else str(lab_val)
+                    cell.value = f"{display_val}\n(已受檢未達控制)"
+                    cell.font = doctor_alert_font
+
+        uacr_cell = ws_doc[f"Y{offset}"]
+        uacr_cell.font = copy(uacr_cell.font)
+        uacr_val_num = parse_float(uacr_cell.value)
+        uacr_dt = parse_date(ws_doc[f"Z{offset}"].value)
+        uacr_pass_mark = normalize_text(ws_main.cell(src_row, uacr_pass_col).value) if uacr_pass_col else ""
+        needs_uacr_by_disease = e_code in (DiseaseCode.CKD, DiseaseCode.DKD)
+        if (
+            uacr_val_num is not None
+            and uacr_pass_mark != "✔"
+            and uacr_dt is not None
+            and uacr_dt.year == Rules.SCREEN_YEAR
+        ):
+            display_val = str(int(uacr_val_num)) if float(uacr_val_num).is_integer() else str(uacr_val_num)
+            uacr_cell.value = f"{display_val}\n(已受檢未達控制)"
+            uacr_cell.font = doctor_alert_font
+        elif (
+            uacr_val_num is not None
+            and uacr_val_num > 30
+            and uacr_dt is not None
+            and uacr_dt.year == Rules.SCREEN_YEAR
+        ):
+            display_val = str(int(uacr_val_num)) if float(uacr_val_num).is_integer() else str(uacr_val_num)
+            uacr_cell.value = f"{display_val}\n(已受檢未達控制)"
+            uacr_cell.font = doctor_alert_font
+        elif needs_uacr_by_disease and (uacr_dt is None or uacr_dt.year != Rules.SCREEN_YEAR):
+            display_val = normalize_text(uacr_cell.value)
+            if display_val:
+                uacr_cell.value = f"{display_val}\n(2026需受檢)"
+            else:
+                uacr_cell.value = "(2026需受檢)"
+            uacr_cell.font = doctor_alert_font
 
     print(f"醫生看 sheet 已寫入 {n} 列")
 
@@ -2655,7 +2854,7 @@ def populate_doctor_sheet(
 _SELF_SELECT_COL_MAP: List[Tuple[str, str]] = [
     ("name", "A"),
     ("id", "B"),
-    ("m_count_114_full", "C"),
+    ("m_count_114", "C"),
     ("m_count_114", "D"),
     ("n_count_115", "E"),
     ("r_amount_114_total", "F"),
@@ -2717,6 +2916,24 @@ def populate_self_select_sheet(
     )
     print(f"自選名單 sheet 已寫入 {n} 列")
 
+
+def _finalize_main_sheet_alignment(ws, data_start: int, last_row: int) -> None:
+    end_col = column_index_from_string(Rules.COL_114_COUNT_Q1_HIDDEN)
+    for row in range(data_start, last_row + 1):
+        for col in range(1, end_col + 1):
+            cell = ws.cell(row, col)
+            if col in _LEFT_COLS:
+                cell.alignment = _get_alignment("left", wrap_text=True)
+            else:
+                cell.alignment = _get_alignment("center", wrap_text=True)
+
+
+def _finalize_self_select_sheet_alignment(ws) -> None:
+    end_col = column_index_from_string("U")
+    for row in range(3, ws.max_row + 1):
+        for col in range(1, end_col + 1):
+            ws.cell(row, col).alignment = _get_alignment("center", wrap_text=True)
+
 # ============================================================
 # 百分位名單 sheet（sheet2）
 # ============================================================
@@ -2725,8 +2942,6 @@ PINK_FILL = openpyxl.styles.PatternFill(fill_type="solid", fgColor="EAC0C0")
 BLUE_FILL = openpyxl.styles.PatternFill(fill_type="solid", fgColor="A9C2D9")
 NO_FILL = openpyxl.styles.PatternFill(fill_type=None)
 PERCENTILE_FONT = Font(size=14)
-PERCENTILE_ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
-PERCENTILE_ALIGN_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
 PERCENTILE_LEFT_OFFSETS = frozenset([0, 4, 7, 8, 9])
 
 
@@ -2912,7 +3127,6 @@ def _apply_percentile_data_row_style(ws, row: int) -> None:
         for offset in range(10):
             cell = ws.cell(row, start_col + offset)
             cell.font = PERCENTILE_FONT
-            cell.alignment = PERCENTILE_ALIGN_LEFT if offset in PERCENTILE_LEFT_OFFSETS else PERCENTILE_ALIGN_CENTER
 
 
 def populate_percentile_sheet(
@@ -2949,6 +3163,22 @@ def populate_percentile_sheet(
             if isinstance(cell.value, (datetime.date, datetime.datetime)):
                 cell.number_format = "yyyy-mm-dd"
     apply_full_grid(ws, ws.max_row, 24)
+
+
+def _finalize_percentile_sheet_alignment(ws) -> None:
+    end_row = ws.max_row
+    while end_row >= 5:
+        if any(ws.cell(end_row, col).value not in (None, "") for col in range(1, 25)):
+            break
+        end_row -= 1
+    for row in range(5, end_row + 1):
+        for start_col in (1, 14):
+            for offset in range(10):
+                cell = ws.cell(row, start_col + offset)
+                if offset in PERCENTILE_LEFT_OFFSETS:
+                    cell.alignment = _get_alignment("left", wrap_text=True)
+                else:
+                    cell.alignment = _get_alignment("center", wrap_text=True)
 
 
 # ============================================================
@@ -3347,12 +3577,12 @@ def _fill_extra_flags(
     last_row: int,
     id_to_rows: Dict[str, List[int]],
     p4p_map: Dict[str, Dict[str, Any]],
-    ascvd_ids: set,
+    member_ids: set,
     self_select_ids: set,
     x115_ids: set,
 ) -> None:
     """填入後段旗標欄位。
-    ascvd_ids: ASCVD 名單的 ID set，用於標記「是否為114會員名單」。
+    member_ids: 會員名單／較需要照護名單的 ID set，用於標記「是否為114會員名單」。
     """
     col_at = cols.get("p4p_status")
     col_plan = cols.get("p4p_plan")
@@ -3366,9 +3596,9 @@ def _fill_extra_flags(
 
     for pid, rows in id_to_rows.items():
         p4p = p4p_map.get(pid, {})
-        is_114       = "v" if pid in ascvd_ids        else None
-        is_self      = "v" if pid in self_select_ids  else None
-        is_115x      = "v" if pid in x115_ids         else None
+        is_114       = "✔" if pid in member_ids       else None
+        is_self      = "✔" if pid in self_select_ids  else None
+        is_115x      = "✔" if pid in x115_ids         else None
         plan         = p4p.get("plan") or None
         status       = p4p.get("status") or None
         enroll_dt    = p4p.get("enroll_dt")
@@ -3698,6 +3928,24 @@ def _canonical_source_sheet_name(sheet_name: str, file_path: str, single_sheet: 
     return sheet_name
 
 
+def _format_mapped_pairs(mapped_pairs: List[str], limit: int = 20) -> str:
+    if not mapped_pairs:
+        return ""
+
+    grouped: Dict[str, List[str]] = {}
+    for item in mapped_pairs[:limit]:
+        left, dst_name = item.rsplit("->", 1)
+        grouped.setdefault(dst_name, []).append(left)
+
+    lines: List[str] = []
+    for dst_name in sorted(grouped):
+        sources = sorted(grouped[dst_name])
+        preview = "、".join(sources[:3])
+        extra = f" 等{len(sources)}筆" if len(sources) > 3 else ""
+        lines.append(f"- {dst_name}：{preview}{extra}")
+    return "\n".join(lines)
+
+
 def _merge_source_folder(folder_path: str):
     """
     將資料夾內所有 Excel 合併成一個暫時 workbook：
@@ -3756,12 +4004,12 @@ def _merge_source_folder(folder_path: str):
         raise ValueError(
             "合併資料夾後仍缺少必要工作表：" + "、".join(missing) +
             "\n\n已讀取檔案：" + "、".join(loaded_files) +
-            ("\n\n已自動對應：" + "、".join(mapped_pairs[:20]) if mapped_pairs else "") +
+            ("\n\n已自動對應：\n" + _format_mapped_pairs(mapped_pairs) if mapped_pairs else "") +
             ("\n略過檔案：" + "、".join(skipped_files) if skipped_files else "")
         )
 
     if mapped_pairs:
-        _log("自動對應工作表：" + " | ".join(mapped_pairs[:20]))
+        _log("自動對應工作表：\n" + _format_mapped_pairs(mapped_pairs))
     if not found_r13210:
         _log("沒有預選/不選會員檔案")
 
@@ -4024,6 +4272,7 @@ def _compute_all_derived(
     _c_note      = cols.get("note")
     _c_score     = cols.get("score")
     _c_breakdown = cols.get("breakdown")
+    _c_metabolic = cols.get("metabolic_enroll")
     _c_au        = cols.get("au")
     _c_av        = cols.get("av")
     _c_aw        = cols.get("aw")
@@ -4089,6 +4338,17 @@ def _compute_all_derived(
         ) if age >= 0 else ""
         safe_set(ws, rr, _c_note, note or None)
 
+        hba_num = parse_float(hba_val)
+        metabolic_flag = (
+            "✔"
+            if _c_metabolic
+            and 20 <= age <= 64
+            and hba_num is not None
+            and 5.7 <= hba_num <= 6.4
+            else None
+        )
+        safe_set_check(ws, rr, _c_metabolic, metabolic_flag)
+
         visit_count_114 = ws.cell(rr, _c_m114).value if _c_m114 else None
         visit_count_115 = ws.cell(rr, _c_n115).value if _c_n115 else None
         claim_amount_114 = ws.cell(rr, _c_r114).value if _c_r114 else None
@@ -4151,8 +4411,9 @@ def _clear_data_rows(
         "adult", "pap", "flu", "fit", "hep",
         "hba", "hba_dt", "ldl", "ldl_dt", "uacr", "uacr_dt",
         "disease_text", "ay_mark", "az_mark", "ak", "ldl_pass", "uacr_pass", "ax", "score", "breakdown", "note",
+        "metabolic_enroll",
         "bb_mark", "bc_mark", "au", "av", "aw",
-        "m_count_114", "m_count_114_full", "n_count_115",
+        "m_count_114", "m_count_114_q1", "n_count_115",
         "r_amount_114", "s_amount_115", "r_amount_114_total", "s_amount_115_total",
         "p4p_plan", "p4p_status", "p4p_enroll_dt", "p4p_last_dt", "p4p_next_dt", "p4p_overdue",
         "is_114", "is_self_select", "is_115x", "address_hidden",
@@ -4182,18 +4443,28 @@ def prepare_template_layout(ws) -> None:
     """補齊 0325 樣板缺少但程式仍需使用的欄位/輔助欄，並先隱藏後段輔助欄。"""
     ws["M1"] = "114年實際申報總額"
     ws["O1"] = "115年實際申報總額"
-    ws["AW1"] = ws["AW1"].value or "備註"
-    ws["AW2"] = ws["AW2"].value or ""
-    ws["AX1"] = ws["AX1"].value or "是否為114會員名單"
-    ws["AY1"] = ws["AY1"].value or "是否為自選會員"
-    ws["AZ1"] = ws["AZ1"].value or "是否為115X"
-    ws["BB1"] = ws["BB1"].value or "114年全年就診次數"
-    ws["BC1"] = ws["BC1"].value or "114年申報總金額"
-    ws["BD1"] = ws["BD1"].value or "115年申報總金額"
-    ws["BE1"] = ws["BE1"].value or "地址"
-    for addr in ("AX2", "AY2", "AZ2", "BB2", "BC2", "BD2", "BE2"):
+    has_note_header = False
+    for row in range(1, 4):
+        for col in range(1, ws.max_column + 1):
+            text = normalize_text(ws.cell(row, col).value)
+            if text in ("預防保健提醒", "備註"):
+                has_note_header = True
+                break
+        if has_note_header:
+            break
+    if not has_note_header:
+        ws["AY1"] = ws["AY1"].value or "預防保健提醒"
+        ws["AY2"] = ws["AY2"].value or ""
+    ws["AZ1"] = ws["AZ1"].value or "是否為114會員名單"
+    ws["BA1"] = ws["BA1"].value or "是否為自選會員"
+    ws["BB1"] = ws["BB1"].value or "是否為115X"
+    ws["BD1"] = ws["BD1"].value or "114年申報總金額"
+    ws["BE1"] = ws["BE1"].value or "115年申報總金額"
+    ws["BF1"] = ws["BF1"].value or "地址"
+    ws["BG1"] = ws["BG1"].value or "114年1-4月就診次數"
+    for addr in ("AZ2", "BA2", "BB2", "BD2", "BE2", "BF2", "BG2"):
         ws[addr] = ws[addr].value or ""
-    for col in range(column_index_from_string("AX"), column_index_from_string("BE") + 1):
+    for col in range(column_index_from_string("AY"), column_index_from_string("BG") + 1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].hidden = True
 
 
@@ -4299,16 +4570,13 @@ def fill_external_data(source_ctx: SourceContext, template_ctx: TemplateContext,
     _log_duplicate_ids(source_ctx.sh_p4p_enroll, "P4P收案")
     _log_duplicate_ids(source_ctx.sh_p4p_track, "P4P追蹤")
     id_aliases = ["身份證號", "身份證號碼", "身分證號", "身分證號碼", "ID", "家醫收案會員ID"]
-    ascvd_ids = build_id_set(source_ctx.sh_ascvd, id_aliases)
-    if not ascvd_ids:
-        ascvd_ids = build_ascvd_member_id_set(source_ctx.sh_member, id_aliases)
     member_ids = build_id_set(source_ctx.sh_member, id_aliases)
     self_select_ids = build_id_set(source_ctx.sh_self_select, id_aliases)
     x115_ids = build_id_set(source_ctx.sh_115x, id_aliases)
     p4p_map = build_p4p_map(source_ctx.sh_p4p_enroll, source_ctx.sh_p4p_track)
     _fill_extra_flags(
         ws, cols, data_start, last_row, id_to_rows,
-        p4p_map, ascvd_ids, self_select_ids, x115_ids,
+        p4p_map, member_ids, self_select_ids, x115_ids,
     )
     _recompute_member_category(ws, cols, id_to_rows, member_ids, self_select_ids, x115_ids)
 
@@ -4385,11 +4653,37 @@ def compute_kpis(
         )
 
 
-def finalize_and_save(source_path: str, template_ctx: TemplateContext, now_dt: datetime.datetime) -> str:
+def _finalize_output_alignments(template_ctx: TemplateContext, runtime_ctx: Optional[RuntimeContext]) -> None:
+    main_last_row = runtime_ctx.last_row if runtime_ctx else template_ctx.ws.max_row
+    _log("整理會員總表對齊")
+    _finalize_main_sheet_alignment(
+        template_ctx.ws,
+        template_ctx.data_start,
+        main_last_row,
+    )
+    if PERCENTILE_SHEET_NAME in template_ctx.wb_tpl.sheetnames:
+        _log("整理百分位名單對齊")
+        _finalize_percentile_sheet_alignment(template_ctx.wb_tpl[PERCENTILE_SHEET_NAME])
+    if DOCTOR_SHEET_NAME in template_ctx.wb_tpl.sheetnames:
+        _log("整理醫生看對齊")
+        _finalize_doctor_sheet_alignment(template_ctx.wb_tpl[DOCTOR_SHEET_NAME])
+    if SELF_SELECT_SHEET_NAME in template_ctx.wb_tpl.sheetnames:
+        _log("整理自選名單對齊")
+        _finalize_self_select_sheet_alignment(template_ctx.wb_tpl[SELF_SELECT_SHEET_NAME])
+
+
+def finalize_and_save(
+    source_path: str,
+    template_ctx: TemplateContext,
+    now_dt: datetime.datetime,
+    runtime_ctx: Optional[RuntimeContext] = None,
+) -> str:
     wb_tpl = template_ctx.wb_tpl
     source_abs = os.path.abspath(source_path)
     source_dir = source_abs if os.path.isdir(source_abs) else os.path.dirname(source_abs)
     base_dir = os.path.dirname(source_dir)
+
+    _finalize_output_alignments(template_ctx, runtime_ctx)
 
     for sht_name in (Rules.SHEET_TARGET, PERCENTILE_SHEET_NAME):
         if sht_name in wb_tpl.sheetnames:
@@ -4408,6 +4702,7 @@ def finalize_and_save(source_path: str, template_ctx: TemplateContext, now_dt: d
         filename = f"選會員{now_dt.strftime('%m%d_%H%M')}.xlsx"
 
     out_path = os.path.join(base_dir, filename)
+    _log("開始寫入 Excel")
     wb_tpl.save(out_path)
     return out_path
 
@@ -4519,7 +4814,7 @@ def process_excel(source_path: str, template_path: str) -> str:
 
     if runtime_ctx.last_row < template_ctx.data_start:
         _log("無會員資料，直接輸出")
-        return finalize_and_save(source_path, template_ctx, now_dt)
+        return finalize_and_save(source_path, template_ctx, now_dt, runtime_ctx)
 
     _log("回填外部資料：ASCVD / 主次診斷 / 篩檢 / HealthCase / 月份統計")
     fill_external_data(source_ctx, template_ctx, runtime_ctx)
@@ -4532,7 +4827,7 @@ def process_excel(source_path: str, template_path: str) -> str:
 
     _log_member_category_counts(template_ctx, runtime_ctx)
     _log("寫入輸出檔案")
-    out = finalize_and_save(source_path, template_ctx, now_dt)
+    out = finalize_and_save(source_path, template_ctx, now_dt, runtime_ctx)
     _log(f"完成輸出：{os.path.basename(out)}")
     return out
 
