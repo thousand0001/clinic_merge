@@ -68,6 +68,7 @@ _FONT_24    = Font(size=24)
 _TZ_TW = datetime.timezone(datetime.timedelta(hours=8))  # 台灣時區，模組層級共用
 _FILL_SCREENING_NOT_NEEDED = PatternFill(fill_type="solid", fgColor="FFF200")
 _FILL_SCREENING_PENDING = PatternFill(fill_type="solid", fgColor="F4CCCC")
+_FILL_SCREENING_EXCLUDED = PatternFill(fill_type="solid", fgColor="D9EAF7")
 _FILL_NONE = PatternFill(fill_type=None)
 _FILL_DOCTOR_LAB_FAIL = PatternFill(fill_type="solid", fgColor="FFC000")
 _FILL_DOCTOR_DATE_DONE = PatternFill(fill_type="solid", fgColor="C6E0B4")
@@ -97,19 +98,6 @@ def _apply_member_row_style(ws, row: int, max_col: int) -> None:
         else:
             cell.font      = _FONT_24
 
-
-SUMMARY_CELLS = {
-    "hba_main_summary":    "AQ2",
-    "hba_target_summary":  "AR2",
-    "ldl_main_summary":    "AS2",
-    "ldl_target_summary":  "AT2",
-    "breakdown_backup":    "BL1",
-}
-
-
-def sc(name: str) -> str:
-    """回傳 KPI 儲存格地址字串"""
-    return SUMMARY_CELLS[name]
 
 # ============================================================
 # 模板欄位 alias（標題偵測優先，不再依賴單一名稱）
@@ -233,15 +221,14 @@ class Rules:
     SHEET_TARGET: str = "會員總表"
     DATA_START_ROW: int = 3
 
-    # 月份申請統計輸出欄位（0325）
-    # L=114全年件數, M=114實際申報總額(1-4月), N=115件數(1-4月), O=115實際申報總額(1-4月)
+    # 月份申請統計輸出欄位
+    # L=114全年件數, M=114實際申報總額(總額), N=115件數(有效月份總次數), O=115實際申報總額(總額)
     COL_114_COUNT: str = "L"
     COL_115_COUNT: str = "N"
     COL_114_AMOUNT: str = "M"
     COL_115_AMOUNT: str = "O"
+    COL_115_COUNT_Q1_HIDDEN: str = "BC"  # 隱藏輔助欄：115年1-4月就診次數
     COL_114_COUNT_Q1_HIDDEN: str = "BG"  # 隱藏輔助欄：114年1-4月就診次數
-    COL_114_AMOUNT_TOTAL: str = "BD"  # 隱藏輔助欄：114總金額
-    COL_115_AMOUNT_TOTAL: str = "BE"  # 隱藏輔助欄：115總金額
     COL_ADDRESS_HIDDEN: str = "BF"    # 隱藏輔助欄：地址
     COL_IS_114: str = "AZ"
     COL_IS_SELF_SELECT: str = "BA"
@@ -292,7 +279,36 @@ class SourceContext:
     sh_p4p_track: Any
     screening_sheets: Dict[str, Any]
     claim_sums: Dict[str, Dict[str, float]]
+    claim_months_115: List[int]
     all_members: Dict[str, Dict[str, Any]]
+
+
+@dataclass
+class MonthlyClaimSheetScan:
+    sheet_name: str
+    header_row: int
+    id_col: int
+    date_col: int
+    count_col: int
+    amount_col: int
+
+
+@dataclass
+class HisbCountSheetScan:
+    sheet_name: str
+    header_row: int
+    name_col: int
+    bday_col: int
+    count_col: int
+    year_bucket: int
+    month: int
+
+
+@dataclass
+class SourceSheetScanCache:
+    monthly_claim_sheets: Dict[str, MonthlyClaimSheetScan]
+    hisb_count_sheets: Dict[str, HisbCountSheetScan]
+    partial_maps: Dict[str, Dict[str, Dict[str, Any]]]
 
 
 @dataclass
@@ -310,6 +326,10 @@ class RuntimeContext:
     last_row: int
     hba_candidates: Optional[List[Tuple[int, float]]] = None
     ldl_candidates: Optional[List[Tuple[int, float]]] = None
+    hba_main_summary: str = ""
+    hba_target_summary: str = ""
+    ldl_main_summary: str = ""
+    ldl_target_summary: str = ""
 
 
 @dataclass
@@ -1071,7 +1091,111 @@ def _find_monthly_claim_header_row(sheet, search_rows: int = 30) -> Optional[int
     return None
 
 
-def collect_monthly_claim_summaries(wb_src) -> Dict[str, Dict[str, float]]:
+def _find_hisb_count_header_row(sheet, search_rows: int = 10) -> Optional[int]:
+    """
+    HIS B 次數 CSV 格式範例：
+    病歷號 / 姓名 / 生日 / 電話 / 次數 / 地址
+    這類資料沒有身份證號與金額，只能用姓名+生日回對會員主表。
+    """
+    for r in range(1, min(search_rows, sheet.max_row) + 1):
+        hmap = build_header_map(sheet, r)
+        chart_col = find_column_exact(hmap, ["病歷號", "病歷號碼"])
+        name_col = find_column_exact(hmap, ["姓名", "病患姓名", "會員姓名"])
+        bday_col = find_column_exact(hmap, ["生日", "出生日期", "出生年月日"])
+        count_col = find_column_exact(hmap, ["次數", "就診次數", "門診次數"])
+        if chart_col and name_col and bday_col and count_col:
+            return r
+    return None
+
+
+def _scan_monthly_claim_sheet(sheet_name: str, sheet: Any) -> Optional[MonthlyClaimSheetScan]:
+    id_aliases = ["ID", "身分證號", "身分證號碼", "身份證號", "身份證號碼", "身分證字號", "身份證字號"]
+    date_aliases = ["日期", "最後看診日期", "最後就診日", "最後看診日"]
+    amount_aliases = ["申報總金額", "總金額", "總額", "申請金額"]
+    header_row = _find_monthly_claim_header_row(sheet, search_rows=30)
+    if header_row is None:
+        return None
+    hmap = build_header_map(sheet, header_row)
+    id_col = find_id_col_by_content(sheet, header_row, find_column_exact(hmap, id_aliases))
+    date_col = find_column_exact(hmap, date_aliases)
+    count_col = find_column_exact(hmap, ["次數"])
+    amount_col = None
+    for alias in amount_aliases:
+        amount_col = find_col_by_keywords_any_row(sheet, header_row, [alias])
+        if amount_col:
+            break
+    if id_col is None or date_col is None or count_col is None or amount_col is None:
+        return None
+    return MonthlyClaimSheetScan(
+        sheet_name=sheet_name,
+        header_row=header_row,
+        id_col=id_col,
+        date_col=date_col,
+        count_col=count_col,
+        amount_col=amount_col,
+    )
+
+
+def _scan_hisb_count_sheet(sheet_name: str, sheet: Any) -> Optional[HisbCountSheetScan]:
+    year_bucket = _sheet_year_bucket(sheet_name)
+    month = _sheet_month(sheet_name)
+    if year_bucket not in (114, 115) or month is None:
+        return None
+    if _find_monthly_claim_header_row(sheet, search_rows=10) is not None:
+        return None
+    header_row = _find_hisb_count_header_row(sheet, search_rows=10)
+    if header_row is None:
+        return None
+    hmap = build_header_map(sheet, header_row)
+    name_col = find_column_exact(hmap, ["姓名", "病患姓名", "會員姓名"])
+    bday_col = find_column_exact(hmap, ["生日", "出生日期", "出生年月日"])
+    count_col = find_column_exact(hmap, ["次數", "就診次數", "門診次數"])
+    if not name_col or not bday_col or not count_col:
+        return None
+    return HisbCountSheetScan(
+        sheet_name=sheet_name,
+        header_row=header_row,
+        name_col=name_col,
+        bday_col=bday_col,
+        count_col=count_col,
+        year_bucket=year_bucket,
+        month=month,
+    )
+
+
+def _scan_source_sheets(wb_src) -> SourceSheetScanCache:
+    id_aliases = ["身份證號", "身份證號碼", "身分證號", "身分證號碼", "身份証號", "身分証號",
+                  "會員身份証", "會員身份證", "會員身分證", "ID", "家醫收案會員ID"]
+    monthly_claim_sheets: Dict[str, MonthlyClaimSheetScan] = {}
+    hisb_count_sheets: Dict[str, HisbCountSheetScan] = {}
+    partial_maps: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for sheet_name in wb_src.sheetnames:
+        sh = wb_src[sheet_name]
+        monthly_scan = _scan_monthly_claim_sheet(sheet_name, sh)
+        if monthly_scan is not None:
+            monthly_claim_sheets[sheet_name] = monthly_scan
+            partial_maps[sheet_name] = _extract_member_partial_map(sh, id_aliases, search_rows=5)
+            continue
+
+        hisb_scan = _scan_hisb_count_sheet(sheet_name, sh)
+        if hisb_scan is not None:
+            hisb_count_sheets[sheet_name] = hisb_scan
+
+        if sheet_name != "會員名單":
+            partial_maps[sheet_name] = _extract_member_partial_map(sh, id_aliases)
+
+    return SourceSheetScanCache(
+        monthly_claim_sheets=monthly_claim_sheets,
+        hisb_count_sheets=hisb_count_sheets,
+        partial_maps=partial_maps,
+    )
+
+
+def collect_monthly_claim_summaries(
+    wb_src,
+    monthly_scans: Optional[Dict[str, MonthlyClaimSheetScan]] = None,
+) -> Tuple[Dict[str, Dict[str, float]], List[int]]:
     """
     掃描 R11440 類明細表，
     依 ID 彙總 R11440 明細格式：
@@ -1082,42 +1206,24 @@ def collect_monthly_claim_summaries(wb_src) -> Dict[str, Dict[str, float]]:
     若某 ID 完全沒有資料，後續保持空白，不填 0。
     """
     out: Dict[str, Dict[str, float]] = {}
-    id_aliases = ["ID", "身分證號", "身分證號碼", "身份證號", "身份證號碼", "身分證字號", "身份證字號"]
-    date_aliases = ["日期", "最後看診日期", "最後就診日", "最後看診日"]
-    amount_aliases = ["申報總金額", "總金額", "總額", "申請金額"]
     seen_115_months: set = set()
+    scans = monthly_scans or {
+        sheet_name: scan
+        for sheet_name in wb_src.sheetnames
+        if (scan := _scan_monthly_claim_sheet(sheet_name, wb_src[sheet_name])) is not None
+    }
 
-    for sheet_name in wb_src.sheetnames:
+    for sheet_name, scan in scans.items():
         sh = wb_src[sheet_name]
-        header_row = _find_monthly_claim_header_row(sh, search_rows=30)
-        if header_row is None:
-            continue
-
-        hmap = build_header_map(sh, header_row)
-        id_col_cand = find_column_exact(hmap, id_aliases)
-        id_col = find_id_col_by_content(sh, header_row, id_col_cand)
-        if id_col is None:
-            continue
-
-        date_col = find_column_exact(hmap, date_aliases)
-        count_col = find_column_exact(hmap, ["次數"])
-        amount_col = None
-        for alias in amount_aliases:
-            amount_col = find_col_by_keywords_any_row(sh, header_row, [alias])
-            if amount_col:
-                break
-        if date_col is None or count_col is None or amount_col is None:
-            continue
-
-        for r in range(header_row + 1, sh.max_row + 1):
-            pid_raw = sh.cell(r, id_col).value
+        for r in range(scan.header_row + 1, sh.max_row + 1):
+            pid_raw = sh.cell(r, scan.id_col).value
             pid = normalize_text(pid_raw).upper()
             if not pid or not is_valid_tw_id(pid):
                 continue
 
-            dt = parse_date(sh.cell(r, date_col).value)
-            cnt = parse_float(sh.cell(r, count_col).value)
-            amt = parse_float(sh.cell(r, amount_col).value)
+            dt = parse_date(sh.cell(r, scan.date_col).value)
+            cnt = parse_float(sh.cell(r, scan.count_col).value)
+            amt = parse_float(sh.cell(r, scan.amount_col).value)
             if dt is None and cnt is None and amt is None:
                 continue
 
@@ -1139,6 +1245,7 @@ def collect_monthly_claim_summaries(wb_src) -> Dict[str, Dict[str, float]]:
                 "114_cnt": 0.0,
                 "114_cnt_full": 0.0,
                 "115_cnt": 0.0,
+                "115_cnt_q1": 0.0,
                 "114_amt": 0.0,
                 "115_amt": 0.0,
                 "114_amt_total": 0.0,
@@ -1152,7 +1259,11 @@ def collect_monthly_claim_summaries(wb_src) -> Dict[str, Dict[str, float]]:
 
             prefix = str(year_bucket)
             if cnt is not None:
-                if is_q1:
+                if year_bucket == 115:
+                    bucket["115_cnt"] += cnt
+                    if is_q1:
+                        bucket["115_cnt_q1"] += cnt
+                elif is_q1:
                     bucket[f"{prefix}_cnt"] += cnt
                 if year_bucket == 114:
                     bucket["114_cnt_full"] += cnt
@@ -1160,11 +1271,89 @@ def collect_monthly_claim_summaries(wb_src) -> Dict[str, Dict[str, float]]:
                 if is_q1:
                     bucket[f"{prefix}_amt"] += amt
                 bucket[f"{prefix}_amt_total"] += amt
-    month_count_115 = float(len(seen_115_months) or 1)
+    month_count_115 = float(len(seen_115_months))
     for bucket in out.values():
         bucket["115_months"] = month_count_115
 
-    return out
+    return out, sorted(seen_115_months)
+
+
+def _supplement_claim_counts_from_hisb(
+    wb_src,
+    all_members: Dict[str, Dict[str, Any]],
+    claim_sums: Dict[str, Dict[str, float]],
+    claim_months_115: List[int],
+    hisb_scans: Optional[Dict[str, HisbCountSheetScan]] = None,
+) -> Tuple[Dict[str, Dict[str, float]], List[int]]:
+    """
+    補吃 HIS B 的「次數 CSV」：
+    - 來源通常是 11402.CSV / 11501.CSV 這類檔名
+    - 只有次數，沒有身份證號/日期/金額
+    - 用 姓名 + 生日 唯一比對到會員 ID 後，將次數累加到月份統計
+    """
+    member_key_to_ids: Dict[Tuple[str, datetime.date], List[str]] = {}
+    for pid, info in all_members.items():
+        name = normalize_text(info.get("name"))
+        bday = info.get("bday")
+        if not name or not isinstance(bday, datetime.date):
+            continue
+        member_key_to_ids.setdefault((name, bday), []).append(pid)
+
+    seen_115_months = set(claim_months_115)
+
+    scans = hisb_scans or {
+        sheet_name: scan
+        for sheet_name in wb_src.sheetnames
+        if (scan := _scan_hisb_count_sheet(sheet_name, wb_src[sheet_name])) is not None
+    }
+
+    for sheet_name, scan in scans.items():
+        sh = wb_src[sheet_name]
+        is_q1 = scan.month <= 4
+        matched_any_115 = False
+        for r in range(scan.header_row + 1, sh.max_row + 1):
+            name = normalize_text(sh.cell(r, scan.name_col).value)
+            bday = parse_date(sh.cell(r, scan.bday_col).value)
+            cnt = parse_float(sh.cell(r, scan.count_col).value)
+            if not name or not isinstance(bday, datetime.date) or cnt is None:
+                continue
+
+            matched_ids = member_key_to_ids.get((name, bday), [])
+            if len(matched_ids) != 1:
+                continue
+
+            pid = matched_ids[0]
+            bucket = claim_sums.setdefault(pid, {
+                "114_cnt": 0.0,
+                "114_cnt_full": 0.0,
+                "115_cnt": 0.0,
+                "115_cnt_q1": 0.0,
+                "114_amt": 0.0,
+                "115_amt": 0.0,
+                "114_amt_total": 0.0,
+                "115_amt_total": 0.0,
+                "115_months": 0.0,
+                "last_visit_ord": 0.0,
+            })
+
+            if scan.year_bucket == 115:
+                bucket["115_cnt"] += cnt
+                if is_q1:
+                    bucket["115_cnt_q1"] += cnt
+                    matched_any_115 = True
+            else:
+                bucket["114_cnt_full"] += cnt
+                if is_q1:
+                    bucket["114_cnt"] += cnt
+
+        if scan.year_bucket == 115 and is_q1 and matched_any_115:
+            seen_115_months.add(scan.month)
+
+    month_count_115 = float(len(seen_115_months))
+    for bucket in claim_sums.values():
+        bucket["115_months"] = month_count_115
+
+    return claim_sums, sorted(seen_115_months)
 
 
 def _to_excel_number(v: Optional[float]) -> Optional[float]:
@@ -1197,12 +1386,10 @@ def fill_monthly_claim_summary_columns(
     col_last = cols.get("last_visit")            # K：最後就診日
     col_m    = cols.get("m_count_114")            # L：114全年件數
     col_n_q1 = cols.get("m_count_114_q1")         # BG：114件數（1-4月，輔助）
-    col_o    = cols.get("n_count_115")            # N：115件數（1-4月）
-    col_s    = cols.get("r_amount_114")           # M：114實際申報總額（1-4月）
-    col_t    = cols.get("s_amount_115")           # O：115實際申報總額（1-4月）
-    col_s_total = cols.get("r_amount_114_total")  # BC：114總金額（輔助）
-    col_t_total = cols.get("s_amount_115_total")  # BD：115總金額（輔助）
-
+    col_o_q1 = cols.get("n_count_115_q1")         # BC：115件數（1-4月，輔助）
+    col_o    = cols.get("n_count_115")            # N：115件數（有效月份總次數）
+    col_s    = cols.get("r_amount_114")           # M：114實際申報總額（總額）
+    col_t    = cols.get("s_amount_115")           # O：115實際申報總額（總額）
     if not all([col_m, col_o, col_s, col_t, cols.get("id")]):
         raise ValueError("模板找不到 L/M/N/O 或 ID 欄位，無法填入月份申請統計")
 
@@ -1216,17 +1403,16 @@ def fill_monthly_claim_summary_columns(
             ws.cell(rr, col_m).value = None
             if col_n_q1:
                 ws.cell(rr, col_n_q1).value = None
+            if col_o_q1:
+                ws.cell(rr, col_o_q1).value = None
             ws.cell(rr, col_o).value = None
             ws.cell(rr, col_s).value = None
             ws.cell(rr, col_t).value = None
-            if col_s_total:
-                ws.cell(rr, col_s_total).value = None
-            if col_t_total:
-                ws.cell(rr, col_t_total).value = None
             continue
 
         v114c    = data.get("114_cnt", 0.0)
         v114c_fy = data.get("114_cnt_full", 0.0)
+        v115c_q1 = data.get("115_cnt_q1", 0.0)
         v115c    = data.get("115_cnt", 0.0)
         v114a    = data.get("114_amt", 0.0)
         v115a    = data.get("115_amt", 0.0)
@@ -1241,19 +1427,19 @@ def fill_monthly_claim_summary_columns(
         ws.cell(rr, col_m).value = _to_excel_number(v114c_fy) if v114c_fy != 0 else None
         if col_n_q1:
             ws.cell(rr, col_n_q1).value = _to_excel_number(v114c) if v114c != 0 else None
+        if col_o_q1:
+            ws.cell(rr, col_o_q1).value = _to_excel_number(v115c_q1) if v115c_q1 != 0 else None
         ws.cell(rr, col_o).value = _to_excel_number(v115c) if v115c != 0 else None
-        ws.cell(rr, col_s).value = _to_excel_int(v114a) if v114a != 0 else None
-        ws.cell(rr, col_t).value = _to_excel_int(v115a) if v115a != 0 else None
-        if col_s_total:
-            ws.cell(rr, col_s_total).value = _to_excel_int(v114a_total) if v114a_total != 0 else None
-        if col_t_total:
-            ws.cell(rr, col_t_total).value = _to_excel_int(v115a_total) if v115a_total != 0 else None
+        ws.cell(rr, col_s).value = _to_excel_int(v114a_total) if v114a_total != 0 else None
+        ws.cell(rr, col_t).value = _to_excel_int(v115a_total) if v115a_total != 0 else None
 
 
 # ============================================================
 # 篩檢需求判斷
 # ============================================================
-def adult_check_interval_years(age: int) -> Optional[int]:
+def adult_check_interval_years(age: int, e_code: Optional[DiseaseCode] = None) -> Optional[int]:
+    if e_code in (DiseaseCode.DM, DiseaseCode.CKD, DiseaseCode.DKD):
+        return None
     if 30 <= age <= 39:
         return 5
     if 40 <= age <= 64:
@@ -1484,6 +1670,7 @@ def _detect_output_cols(ws, header_row: int, max_scan_row: int) -> Dict[str, Opt
         "is_115x":        kw(ws, header_row, ["是否為115X"]),
         "m_count_114":    kw(ws, header_row, ["114年", "就診次數"]),
         "m_count_114_q1": kw(ws, header_row, ["114年1-4月就診次數"]),
+        "n_count_115_q1": kw(ws, header_row, ["115年1-4月就診次數"]),
         "n_count_115":    kw(ws, header_row, ["115年", "就診次數"]),
         "r_amount_114":   (kw(ws, header_row, ["114年", "實際申報總額"])
                            or kw(ws, header_row, ["114年", "申報總額"])
@@ -1491,8 +1678,6 @@ def _detect_output_cols(ws, header_row: int, max_scan_row: int) -> Dict[str, Opt
         "s_amount_115":   (kw(ws, header_row, ["115年", "實際申報總額"])
                            or kw(ws, header_row, ["115年", "申報總額"])
                            or kw(ws, header_row, ["115年", "申報金額", "月"])),
-        "r_amount_114_total": kw(ws, header_row, ["114年申報總金額"]),
-        "s_amount_115_total": kw(ws, header_row, ["115年申報總金額"]),
         "address_hidden": kw(ws, header_row, ["地址"]),
     }
 
@@ -1679,7 +1864,7 @@ def should_check_ldl_pass(
     if token == "b":
         return v < 70.0
     if is_normal:
-        return v <= 130.0
+        return v < 130.0
     if has_dm:
         return v < 100.0
     if has_ckd:
@@ -1765,6 +1950,7 @@ def build_ax_leak_item(
 def build_screening_note(
     *,
     age:      int,
+    e_code:   Optional[DiseaseCode] = None,
     sex:      str,
     hep_dt:   Optional[datetime.date],
     fit_dt:   Optional[datetime.date],
@@ -1787,7 +1973,7 @@ def build_screening_note(
         if pap_dt is None or (today.year - pap_dt.year) >= pap_interval:
             msgs.append("今年需檢測子抹")
 
-    adult_interval = adult_check_interval_years(age)
+    adult_interval = adult_check_interval_years(age, e_code)
     if adult_interval:
         if adult_dt is None or (today.year - adult_dt.year) >= adult_interval:
             msgs.append("今年需檢測成健")
@@ -1832,18 +2018,6 @@ def _score_screening(dt: Optional[datetime.date], pts: int) -> int:
     return 0
 
 
-def _score_age(age: int, sex: str) -> int:
-    sex = normalize_text(sex)
-    if age < 18:  # 年齡未知（-1）或不合理（<18）均不給分
-        return 0
-    # 業務規則：年輕族群額外加分，女性 25 歲以下 / 男性 30 歲以下均給 28 分。
-    if sex == "女" and age <= 25:
-        return 28
-    if sex == "男" and age <= 30:
-        return 28
-    return 0
-
-
 def _safe_int(value: Any) -> int:
     if value is None:
         return 0
@@ -1868,7 +2042,7 @@ def _score_visit_count(count_115: Any, count_114: Any) -> int:
         return 4
     if 4 <= n114 <= 7:
         return 2
-    return 1 if n114 >= 0 else 0
+    return 1 if n114 > 0 else 0
 
 
 def _score_fee(claim_amount_114: Any, claim_amount_115: Any) -> int:
@@ -1888,6 +2062,7 @@ def _ever_done(dt: Optional[datetime.date]) -> bool:
 
 
 def _score_prevention(
+    e_code: Optional[DiseaseCode],
     age: int,
     sex: str,
     adult_dt: Optional[datetime.date],
@@ -1901,51 +2076,60 @@ def _score_prevention(
         return 0
 
     score = 28
-    years_110_114 = {2021, 2022, 2023, 2024, 2025}
-    years_112_114 = {2023, 2024, 2025}
-    years_113_114 = {2024, 2025}
-    year_114 = {2025}
+    years_110_115 = {2021, 2022, 2023, 2024, 2025, 2026}
+    years_112_115 = {2023, 2024, 2025, 2026}
+    years_113_115 = {2024, 2025, 2026}
+    year_115 = {2026}
 
     def deduct(done: bool, points: int) -> None:
         nonlocal score
         if not done:
             score -= points
 
+    adult_interval = adult_check_interval_years(age, e_code)
+
     if sex == "男":
         if 30 <= age <= 39:
-            deduct(_done_in_years(adult_dt, years_110_114), 6)
+            if adult_interval:
+                deduct(_done_in_years(adult_dt, years_110_115), 6)
         elif 40 <= age <= 64:
-            deduct(_done_in_years(adult_dt, years_112_114), 6)
+            if adult_interval:
+                deduct(_done_in_years(adult_dt, years_112_115), 6)
         elif age >= 65:
-            deduct(_done_in_years(adult_dt, year_114), 6)
+            if adult_interval:
+                deduct(_done_in_years(adult_dt, year_115), 6)
 
         if 45 <= age <= 75:
-            deduct(_done_in_years(fit_dt, years_113_114), 6)
+            deduct(_done_in_years(fit_dt, years_113_115), 6)
         if age >= 45:
             deduct(_ever_done(hep_dt), 6)
         if age >= 65:
-            deduct(_done_in_years(flu_dt, year_114), 4)
+            deduct(_done_in_years(flu_dt, year_115), 4)
 
     elif sex == "女":
         if 25 <= age <= 29:
-            deduct(_done_in_years(pap_dt, years_112_114), 6)
-            deduct(_done_in_years(adult_dt, years_110_114), 6)
+            deduct(_done_in_years(pap_dt, years_112_115), 6)
+            if adult_interval:
+                deduct(_done_in_years(adult_dt, years_110_115), 6)
         elif 30 <= age <= 39:
-            deduct(_done_in_years(pap_dt, year_114), 6)
-            deduct(_done_in_years(adult_dt, years_110_114), 6)
+            deduct(_done_in_years(pap_dt, year_115), 6)
+            if adult_interval:
+                deduct(_done_in_years(adult_dt, years_110_115), 6)
         elif 40 <= age <= 64:
-            deduct(_done_in_years(pap_dt, year_114), 6)
-            deduct(_done_in_years(adult_dt, years_112_114), 6)
+            deduct(_done_in_years(pap_dt, year_115), 6)
+            if adult_interval:
+                deduct(_done_in_years(adult_dt, years_112_115), 6)
         elif age >= 65:
-            deduct(_done_in_years(pap_dt, year_114), 6)
-            deduct(_done_in_years(adult_dt, year_114), 6)
+            deduct(_done_in_years(pap_dt, year_115), 6)
+            if adult_interval:
+                deduct(_done_in_years(adult_dt, year_115), 6)
 
         if 45 <= age <= 75:
-            deduct(_done_in_years(fit_dt, years_113_114), 6)
+            deduct(_done_in_years(fit_dt, years_113_115), 6)
         if age >= 45:
             deduct(_ever_done(hep_dt), 6)
         if age >= 65:
-            deduct(_done_in_years(flu_dt, year_114), 4)
+            deduct(_done_in_years(flu_dt, year_115), 4)
 
     return max(score, 0)
 
@@ -1980,9 +2164,9 @@ def _score_ldl_management(
 
     token = _ascvd_token(ascvd_raw)
     if token == "a":
-        return 5 if v < 70.0 else 0
-    if token == "b":
         return 5 if v < 55.0 else 0
+    if token == "b":
+        return 5 if v < 70.0 else 0
     if e_code in (DiseaseCode.DM, DiseaseCode.DKD):
         return 5 if v < 100.0 else 0
     if e_code == DiseaseCode.CKD:
@@ -2032,7 +2216,7 @@ def calc_score(
     visit_count_114: Any,
     visit_count_115: Any,
 ) -> Tuple[int, str]:
-    prevention_total = _score_prevention(age, sex, adult_dt, pap_dt, flu_dt, fit_dt, hep_dt)
+    prevention_total = _score_prevention(e_code, age, sex, adult_dt, pap_dt, flu_dt, fit_dt, hep_dt)
     fee_score = _score_fee(claim_amount_114, claim_amount_115)
     exam_score = _score_management_total(e_code, ascvd_raw, age, hba_val, hba_dt, ldl_val, ldl_dt)
     visit_score = _score_visit_count(visit_count_115, visit_count_114)
@@ -2152,16 +2336,29 @@ def build_followup_note(
 # ============================================================
 # KPI：HbA1c（AY8 / AZ7 / AZ8 / AZ9）
 # ============================================================
-def _write_ratio(ws, addr: str, numer: int, denom: int) -> None:
-    ws[addr].value = (numer / denom) if denom > 0 else 0
-    ws[addr].number_format = "0.00%"
-
-
-def _write_summary_text(ws, addr: str, label: Optional[str], numer: int, denom: int) -> None:
+def _make_summary_text(label: Optional[str], numer: int, denom: int) -> str:
     label_txt = label or ""
     ratio_txt = _fmt_percent((numer / denom) if denom > 0 else 0.0, denom)
     fraction_txt = f"{numer}/{denom}" if denom > 0 else "0/0"
-    ws[addr].value = f"{label_txt}，{ratio_txt}，{fraction_txt}"
+    return f"{label_txt}，{ratio_txt}，{fraction_txt}"
+
+
+def _write_legacy_kpi_summary_cells(
+    ws,
+    *,
+    hba_main_summary: str,
+    hba_target_summary: str,
+    ldl_main_summary: str,
+    ldl_target_summary: str,
+) -> None:
+    """
+    相容既有模板：保留 AQ2:AT2 的 KPI 摘要文字，
+    避免舊版依賴這 4 格的輸出內容時出現差異。
+    """
+    ws["AQ2"] = hba_main_summary
+    ws["AR2"] = hba_target_summary
+    ws["AS2"] = ldl_main_summary
+    ws["AT2"] = ldl_target_summary
 
 
 def _collect_hba_candidates(
@@ -2243,29 +2440,30 @@ def collect_kpi_mark_sets(
 def calc_hba_kpi_ay_az(
     ws, cols: Dict[str, Optional[int]], data_start: int, last_row: int,
     hba_candidates: Optional[List[Tuple[int, float]]] = None,
-) -> None:
+) -> Tuple[str, str]:
     if hba_candidates is None:
         hba_candidates = _collect_hba_candidates(ws, cols, data_start, last_row)
     hba_values = [v for _, v in hba_candidates]
     denom = len(hba_values)
 
     numer_ay = sum(1 for v in hba_values if v <= Rules.HBA_CONTROL_THRESHOLD)
-    _write_summary_text(ws, sc("hba_main_summary"), "<=7", numer_ay, denom)
+    main_summary = _make_summary_text("<=7", numer_ay, denom)
 
     if denom <= 0:
-        _write_summary_text(ws, sc("hba_target_summary"), "", 0, 0)
+        target_summary = _make_summary_text("", 0, 0)
         print("AZ 分母=0，分子=0，比例=0.00%，切點=None")
-        return
+        return main_summary, target_summary
 
     hba_values.sort()
     k = int(math.ceil(Rules.HBA_TARGET_PERCENT * denom))
     k = max(1, min(k, denom))
     cutoff = hba_values[k - 1]
 
-    _write_summary_text(ws, sc("hba_target_summary"), f"<={cutoff:.2f}", k, denom)
+    target_summary = _make_summary_text(f"<={cutoff:.2f}", k, denom)
 
     ratio = k / denom
     print(f"AZ 分母={denom}，分子={k}，比例={ratio*100:.2f}%，切點={cutoff:.2f}")
+    return main_summary, target_summary
 
 
 # ============================================================
@@ -2274,7 +2472,7 @@ def calc_hba_kpi_ay_az(
 def calc_ldl_percentiles(
     ws, cols: Dict[str, Optional[int]], data_start: int, last_row: int,
     ldl_candidates: Optional[List[Tuple[int, float]]] = None,
-) -> None:
+) -> Tuple[str, str]:
     if ldl_candidates is None:
         ldl_candidates = _collect_ldl_candidates(ws, cols, data_start, last_row)
     ldl_values = [v for _, v in ldl_candidates]
@@ -2282,22 +2480,23 @@ def calc_ldl_percentiles(
     denom = len(ldl_values)
 
     numer_bb = sum(1 for v in ldl_values if v <= th_control)
-    _write_summary_text(ws, sc("ldl_main_summary"), "<=100", numer_bb, denom)
+    main_summary = _make_summary_text("<=100", numer_bb, denom)
 
     if denom <= 0:
-        _write_summary_text(ws, sc("ldl_target_summary"), "", 0, 0)
+        target_summary = _make_summary_text("", 0, 0)
         print("BC 分母=0，分子=0，比例=0.00%，切點=None")
-        return
+        return main_summary, target_summary
 
     ldl_values.sort()
     k = int(math.ceil(Rules.LDL_TARGET_PERCENT * denom))
     k = max(1, min(k, denom))
     cutoff = ldl_values[k - 1]
 
-    _write_summary_text(ws, sc("ldl_target_summary"), f"<={cutoff:.1f}".replace(".0", ""), k, denom)
+    target_summary = _make_summary_text(f"<={cutoff:.1f}".replace(".0", ""), k, denom)
 
     ratio = k / denom
     print(f"BC 分母={denom}，分子={k}，比例={ratio*100:.2f}%，切點={cutoff:.0f}")
+    return main_summary, target_summary
 
 
 # ============================================================
@@ -2332,7 +2531,6 @@ def apply_amount_format(
 ) -> None:
     amount_col_keys = [
         "r_amount_114", "s_amount_115",
-        "r_amount_114_total", "s_amount_115_total",
     ]
     amount_cols = [cols.get(k) for k in amount_col_keys if cols.get(k)]
     for r in range(data_start, last_row + 1):
@@ -2446,11 +2644,17 @@ _DOCTOR_COL_MAP: List[Tuple[str, str]] = [
     ("dmk_code", "H"),
     ("ascvd", "I"),
     ("last_visit", "J"),
+    # 醫生看 K-O 對應：
+    # K = 總表 L = 114全年就診次數
+    # L = 總表隱藏輔助欄 BG = 114年1-4月就診次數
+    # M = 總表 N = 115年有效月份總就診次數
+    # N = 總表 M = 114全年申報總金額
+    # O = 總表 O = 115年申報總金額
     ("m_count_114", "K"),
     ("m_count_114_q1", "L"),
     ("n_count_115", "M"),
-    ("r_amount_114_total", "N"),
-    ("s_amount_115_total", "O"),
+    ("r_amount_114", "N"),
+    ("s_amount_115", "O"),
     ("adult", "P"),
     ("pap", "Q"),
     ("flu", "R"),
@@ -2472,6 +2676,7 @@ _DOCTOR_COL_MAP: List[Tuple[str, str]] = [
     ("is_114", "AH"),
     ("score", "AI"),
     ("breakdown", "AN"),
+    ("metabolic_enroll", "AP"),
     ("note", "AO"),
 ]
 
@@ -2498,10 +2703,13 @@ def _doctor_screening_status(
     kind: str,
     *,
     age: int,
+    e_code: Optional[DiseaseCode] = None,
     sex: str,
 ) -> Tuple[str, PatternFill]:
     if kind == "adult":
-        needed = adult_check_interval_years(age) is not None
+        if e_code in (DiseaseCode.DM, DiseaseCode.CKD, DiseaseCode.DKD):
+            return "為DM/CKD/DKD排除個案", _FILL_SCREENING_EXCLUDED
+        needed = adult_check_interval_years(age, e_code) is not None
     elif kind == "pap":
         needed = pap_check_interval_years(age, sex) is not None
     elif kind == "flu":
@@ -2523,13 +2731,14 @@ def _doctor_screening_is_overdue(
     *,
     dt: Optional[datetime.date],
     age: int,
+    e_code: Optional[DiseaseCode] = None,
     sex: str,
     today: datetime.date,
     ) -> bool:
     if not isinstance(dt, datetime.date):
         return False
     if kind == "adult":
-        interval = adult_check_interval_years(age)
+        interval = adult_check_interval_years(age, e_code)
         return bool(interval and (today.year - dt.year) >= interval)
     if kind == "pap":
         interval = pap_check_interval_years(age, sex)
@@ -2644,12 +2853,12 @@ def _doctor_cell_alignment(col_letter: str, value: Any) -> Alignment:
     if col_letter in {"U", "W"}:
         return _get_alignment("center", wrap_text="\n" in text)
     if col_letter in {"V", "X"}:
-        return _get_alignment("center", wrap_text=text in ("待受檢", "不需受檢"))
+        return _get_alignment("center", wrap_text=text in ("待受檢", "不需受檢", "為DM/CKD/DKD排除個案"))
     return _get_alignment("center", wrap_text=False)
 
 
 def _finalize_doctor_sheet_alignment(ws_doc) -> None:
-    end_col = column_index_from_string("AO")
+    end_col = column_index_from_string("AP")
     for row in range(4, ws_doc.max_row + 1):
         for col in range(1, end_col + 1):
             cell = ws_doc.cell(row, col)
@@ -2728,13 +2937,13 @@ def populate_doctor_sheet(
             cell = ws_doc[f"{col_letter}{offset}"]
             dt = parse_date(cell.value)
             if dt is not None:
-                if _doctor_screening_is_overdue(kind, dt=dt, age=age_num, sex=sex_val, today=today):
+                if _doctor_screening_is_overdue(kind, dt=dt, age=age_num, e_code=e_code, sex=sex_val, today=today):
                     cell.value = f"{dt.strftime('%Y-%m-%d')}\n(過期待受檢)"
                     cell.fill = _FILL_SCREENING_NOT_NEEDED
                 continue
             if cell.value not in (None, ""):
                 continue
-            status_text, status_fill = _doctor_screening_status(kind, age=age_num, sex=sex_val)
+            status_text, status_fill = _doctor_screening_status(kind, age=age_num, e_code=e_code, sex=sex_val)
             cell.value = status_text
             cell.fill = status_fill
             cell.border = _BORDER_THIN_GRAY
@@ -2857,8 +3066,8 @@ _SELF_SELECT_COL_MAP: List[Tuple[str, str]] = [
     ("m_count_114", "C"),
     ("m_count_114", "D"),
     ("n_count_115", "E"),
-    ("r_amount_114_total", "F"),
-    ("s_amount_115_total", "G"),
+    ("r_amount_114", "F"),
+    ("s_amount_115", "G"),
     ("adult", "H"),
     ("pap", "I"),
     ("flu", "J"),
@@ -2918,7 +3127,7 @@ def populate_self_select_sheet(
 
 
 def _finalize_main_sheet_alignment(ws, data_start: int, last_row: int) -> None:
-    end_col = column_index_from_string(Rules.COL_114_COUNT_Q1_HIDDEN)
+    end_col = _main_alignment_end_col(ws)
     for row in range(data_start, last_row + 1):
         for col in range(1, end_col + 1):
             cell = ws.cell(row, col)
@@ -3131,7 +3340,10 @@ def _apply_percentile_data_row_style(ws, row: int) -> None:
 
 def populate_percentile_sheet(
     wb_tpl,
-    ws_main,
+    hba_main_summary: str,
+    hba_target_summary: str,
+    ldl_main_summary: str,
+    ldl_target_summary: str,
     cols: Dict[str, Optional[int]],
     data_start: int,
     last_row: int,
@@ -3141,10 +3353,11 @@ def populate_percentile_sheet(
     else:
         ws = wb_tpl[PERCENTILE_SHEET_NAME]
 
+    ws_main = wb_tpl[Rules.SHEET_TARGET]
     ldl_records, hba_records = _collect_percentile_records(ws_main, cols, data_start, last_row)
 
-    _set_percentile_title_rich(ws, "A1", "LDL百分位", ws_main[sc("ldl_main_summary")].value, ws_main[sc("ldl_target_summary")].value)
-    _set_percentile_title_rich(ws, "N1", "HBA1C百分位", ws_main[sc("hba_main_summary")].value, ws_main[sc("hba_target_summary")].value)
+    _set_percentile_title_rich(ws, "A1", "LDL百分位", ldl_main_summary, ldl_target_summary)
+    _set_percentile_title_rich(ws, "N1", "HBA1C百分位", hba_main_summary, hba_target_summary)
     ws["A2"] = "紅色：達到標準、藍色：達到73.8%"
     ws["N2"] = "紅色：達到標準、藍色：達到73.8%"
 
@@ -3184,7 +3397,7 @@ def _finalize_percentile_sheet_alignment(ws) -> None:
 # ============================================================
 # 全名單整合（v3 新增）
 # ============================================================
-def _id_from_sheet(sheet, header_aliases: List[str], search_rows: int = 10) -> Optional[int]:
+def _id_from_sheet(sheet, header_aliases: List[str], search_rows: int = 10) -> Tuple[Optional[int], int]:
     """從 sheet 找 ID 欄（靠 header + 內容驗證）"""
     header_row = _find_header_row_contains_any(sheet, [header_aliases], search_rows=search_rows)
     if header_row is None:
@@ -3282,7 +3495,10 @@ def _extract_member_partial_map(
     return result
 
 
-def collect_all_members(wb_src) -> Dict[str, Dict[str, Any]]:
+def collect_all_members(
+    wb_src,
+    partial_maps: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+) -> Dict[str, Dict[str, Any]]:
     """
     整合所有 sheet 的人員名單，以身份證號為鍵，去重複。
     各來源採「缺什麼補什麼」原則：已有值的欄位不會被空值覆蓋。
@@ -3304,17 +3520,11 @@ def collect_all_members(wb_src) -> Dict[str, Dict[str, Any]]:
         key=lambda s: (int(s[:3]), _sheet_month(s))
     )
     processed_sheets = set(month_sheets)
-    _month_header_row: Optional[int] = None
-    _month_id_col:     Optional[int] = None
     for sname in month_sheets:
         sh = wb_src[sname]
-        if _month_id_col is None:
-            _month_header_row = _find_header_row_contains_any(sh, [id_aliases], search_rows=5) or 1
-            hmap = build_header_map(sh, _month_header_row)
-            _month_id_col = find_id_col_by_content(sh, _month_header_row, find_column_exact(hmap, id_aliases))
-        if _month_id_col is None:
-            continue
-        partial_map = _extract_member_partial_map(sh, id_aliases, search_rows=5)
+        partial_map = (partial_maps or {}).get(sname)
+        if partial_map is None:
+            partial_map = _extract_member_partial_map(sh, id_aliases, search_rows=5)
         for pid, partial in partial_map.items():
             rec = _get_or_create(pid)
             for key, value in partial.items():
@@ -3326,7 +3536,9 @@ def collect_all_members(wb_src) -> Dict[str, Dict[str, Any]]:
             continue
         processed_sheets.add(sname)
         sh = wb_src[sname]
-        partial_map = _extract_member_partial_map(sh, id_aliases)
+        partial_map = (partial_maps or {}).get(sname)
+        if partial_map is None:
+            partial_map = _extract_member_partial_map(sh, id_aliases)
         for pid, partial in partial_map.items():
             rec = _get_or_create(pid)
             for key, value in partial.items():
@@ -3337,7 +3549,9 @@ def collect_all_members(wb_src) -> Dict[str, Dict[str, Any]]:
         if sname in processed_sheets or sname == "會員名單":
             continue
         sh = wb_src[sname]
-        partial_map = _extract_member_partial_map(sh, id_aliases)
+        partial_map = (partial_maps or {}).get(sname)
+        if partial_map is None:
+            partial_map = _extract_member_partial_map(sh, id_aliases)
         for pid, partial in partial_map.items():
             rec = _get_or_create(pid)
             for key, value in partial.items():
@@ -3720,7 +3934,7 @@ def _append_sheet_rows(src_ws, dst_ws, skip_header: bool = False) -> None:
 def _load_csv_as_workbook(csv_path: str):
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Sheet1"
+    ws.title = os.path.splitext(os.path.basename(csv_path))[0][:31] or "Sheet1"
 
     encodings = ("utf-8-sig", "utf-8", "cp950", "big5")
     last_error: Optional[Exception] = None
@@ -3805,7 +4019,13 @@ def _load_xlsx_as_workbook(xlsx_path: str):
         if "could not read worksheets" not in msg and "wildcard" not in msg:
             raise
         repaired_path = _strip_worksheet_autofilters(xlsx_path)
-        return openpyxl.load_workbook(repaired_path, data_only=True)
+        try:
+            return openpyxl.load_workbook(repaired_path, data_only=True)
+        finally:
+            try:
+                os.unlink(repaired_path)
+            except OSError:
+                pass
 
 
 def _normalize_sheet_lookup(text: Any) -> str:
@@ -4158,13 +4378,23 @@ def _fill_screening(
 ) -> None:
     if not target_col:
         return
-    hmap    = build_header_map(sheet, 1)
+    header_row = _find_header_row_contains_any(
+        sheet,
+        [["ID", "身分證號", "身份證號"], ["最後篩檢日期"]],
+        search_rows=10,
+    ) or 1
+    hmap    = build_header_map(sheet, header_row)
     sid_col = find_column_exact(hmap, ["ID", "身分證號", "身份證號"])
     dt_col  = find_column_exact(hmap, ["最後篩檢日期"])
     if sid_col is None or dt_col is None:
-        raise ValueError(f"「{sheet.title}」找不到 ID 或 最後篩檢日期 欄位")
+        missing = []
+        if sid_col is None:
+            missing.append("ID")
+        if dt_col is None:
+            missing.append("最後篩檢日期")
+        raise ValueError(f"「{sheet.title}」找不到欄位：{' / '.join(missing)}")
 
-    for rr in range(2, sheet.max_row + 1):
+    for rr in range(header_row + 1, sheet.max_row + 1):
         pid = normalize_id(sheet.cell(rr, sid_col).value)
         dt  = parse_date(sheet.cell(rr, dt_col).value)
         if not pid or dt is None:
@@ -4186,7 +4416,6 @@ def _fill_health_case(
     cols:      Dict[str, Optional[int]],
     id_to_rows: Dict[str, List[int]],
 ) -> None:
-    hmap = build_header_map(sh_health, 1)
     field_aliases = {
         "hc_id":      ["家醫收案會員ID", "ID"],
         "hc_hba":     ["最近一次HbA1c檢查結果(%)"],
@@ -4196,14 +4425,29 @@ def _fill_health_case(
         "hc_uacr":    ["最近一次UACR檢查結果(mg/gm)"],
         "hc_uacr_dt": ["最近一次UACR檢查日期"],
     }
+    header_row = _find_header_row_contains_any(
+        sh_health,
+        [field_aliases["hc_id"], field_aliases["hc_hba"], field_aliases["hc_ldl"], field_aliases["hc_uacr"]],
+        search_rows=10,
+    ) or 1
+    hmap = build_header_map(sh_health, header_row)
     fc = {k: find_column_exact(hmap, v) for k, v in field_aliases.items()}
     if any(v is None for v in fc.values()):
+        missing_labels = {
+            "hc_id": "家醫收案會員ID / ID",
+            "hc_hba": "最近一次HbA1c檢查結果(%)",
+            "hc_hba_dt": "最近一次HbA1c檢查日期",
+            "hc_ldl": "最近一次LDL檢查結果(mg/dL)",
+            "hc_ldl_dt": "最近一次LDL檢查日期",
+            "hc_uacr": "最近一次UACR檢查結果(mg/gm)",
+            "hc_uacr_dt": "最近一次UACR檢查日期",
+        }
+        missing = [missing_labels[k] for k, v in fc.items() if v is None]
         raise ValueError(
-            "原始檔「HealthCase」欄位不完整"
-            "（家醫收案會員ID / HbA1c結果+日期 / LDL結果+日期 / UACR結果+日期）"
+            f"原始檔「HealthCase」欄位不完整：{' / '.join(missing)}"
         )
 
-    for r in range(2, sh_health.max_row + 1):
+    for r in range(header_row + 1, sh_health.max_row + 1):
         pid = normalize_id(sh_health.cell(r, fc["hc_id"]).value)
         if not pid:
             continue
@@ -4332,7 +4576,7 @@ def _compute_all_derived(
 
         # 年齡未知時不產生篩檢備註，避免以 0 歲誤判
         note = build_screening_note(
-            age=age, sex=sex,
+            age=age, e_code=e_code, sex=sex,
             hep_dt=hep_dt, fit_dt=fit_dt, pap_dt=pap_dt,
             adult_dt=adult_dt, flu_dt=flu_dt, today=now,
         ) if age >= 0 else ""
@@ -4359,10 +4603,10 @@ def _compute_all_derived(
             pid = normalize_text(ws.cell(rr, _c_id).value).upper()
             data = claim_sums.get(pid)
             if data:
-                v114a = data.get("114_amt", 0.0)
+                v114a_total = data.get("114_amt_total", 0.0)
                 v115a = data.get("115_amt", 0.0)
                 v115_months = max(int(data.get("115_months", 0.0)), 1)
-                fee_score_amount_114 = (v114a / 12.0) if v114a != 0 else None
+                fee_score_amount_114 = (v114a_total / 12.0) if v114a_total != 0 else None
                 fee_score_amount_115 = (v115a / float(v115_months)) if v115a != 0 else None
 
         score, breakdown = calc_score(
@@ -4413,8 +4657,8 @@ def _clear_data_rows(
         "disease_text", "ay_mark", "az_mark", "ak", "ldl_pass", "uacr_pass", "ax", "score", "breakdown", "note",
         "metabolic_enroll",
         "bb_mark", "bc_mark", "au", "av", "aw",
-        "m_count_114", "m_count_114_q1", "n_count_115",
-        "r_amount_114", "s_amount_115", "r_amount_114_total", "s_amount_115_total",
+        "m_count_114", "m_count_114_q1", "n_count_115_q1", "n_count_115",
+        "r_amount_114", "s_amount_115",
         "p4p_plan", "p4p_status", "p4p_enroll_dt", "p4p_last_dt", "p4p_next_dt", "p4p_overdue",
         "is_114", "is_self_select", "is_115x", "address_hidden",
         "last_visit", "dx_raw",
@@ -4439,33 +4683,61 @@ def _require_sheet(wb, *names: str):
     return sheet
 
 
+def _find_header_col_in_rows(ws, labels: List[str], max_scan_row: int = 3) -> Optional[int]:
+    targets = {normalize_text(label) for label in labels if label}
+    for row in range(1, min(max_scan_row, ws.max_row) + 1):
+        for col in range(1, ws.max_column + 1):
+            if normalize_text(ws.cell(row, col).value) in targets:
+                return col
+    return None
+
+
+def _ensure_aux_header(
+    ws,
+    labels: List[str],
+    preferred_letter: str,
+    *,
+    row1_value: str,
+    row2_default: str = "",
+) -> int:
+    existing_col = _find_header_col_in_rows(ws, labels)
+    if existing_col is not None:
+        return existing_col
+
+    col = column_index_from_string(preferred_letter)
+    ws.cell(1, col).value = ws.cell(1, col).value or row1_value
+    ws.cell(2, col).value = ws.cell(2, col).value or row2_default
+    return col
+
+
+def _main_alignment_end_col(ws) -> int:
+    labels = [
+        "預防保健提醒", "備註",
+        "是否為114會員名單", "是否為自選會員", "是否為115X",
+        "115年1-4月就診次數", "114年1-4月就診次數", "地址",
+    ]
+    found_cols = [
+        col for col in (_find_header_col_in_rows(ws, [label]) for label in labels)
+        if col is not None
+    ]
+    return max(found_cols) if found_cols else column_index_from_string(Rules.COL_114_COUNT_Q1_HIDDEN)
+
+
 def prepare_template_layout(ws) -> None:
     """補齊 0325 樣板缺少但程式仍需使用的欄位/輔助欄，並先隱藏後段輔助欄。"""
     ws["M1"] = "114年實際申報總額"
     ws["O1"] = "115年實際申報總額"
-    has_note_header = False
-    for row in range(1, 4):
-        for col in range(1, ws.max_column + 1):
-            text = normalize_text(ws.cell(row, col).value)
-            if text in ("預防保健提醒", "備註"):
-                has_note_header = True
-                break
-        if has_note_header:
-            break
-    if not has_note_header:
-        ws["AY1"] = ws["AY1"].value or "預防保健提醒"
-        ws["AY2"] = ws["AY2"].value or ""
-    ws["AZ1"] = ws["AZ1"].value or "是否為114會員名單"
-    ws["BA1"] = ws["BA1"].value or "是否為自選會員"
-    ws["BB1"] = ws["BB1"].value or "是否為115X"
-    ws["BD1"] = ws["BD1"].value or "114年申報總金額"
-    ws["BE1"] = ws["BE1"].value or "115年申報總金額"
-    ws["BF1"] = ws["BF1"].value or "地址"
-    ws["BG1"] = ws["BG1"].value or "114年1-4月就診次數"
-    for addr in ("AZ2", "BA2", "BB2", "BD2", "BE2", "BF2", "BG2"):
-        ws[addr] = ws[addr].value or ""
-    for col in range(column_index_from_string("AY"), column_index_from_string("BG") + 1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].hidden = True
+    hidden_cols = {
+        _ensure_aux_header(ws, ["預防保健提醒", "備註"], "AY", row1_value="預防保健提醒"),
+        _ensure_aux_header(ws, ["是否為114會員名單"], "AZ", row1_value="是否為114會員名單"),
+        _ensure_aux_header(ws, ["是否為自選會員"], "BA", row1_value="是否為自選會員"),
+        _ensure_aux_header(ws, ["是否為115X"], "BB", row1_value="是否為115X"),
+        _ensure_aux_header(ws, ["115年1-4月就診次數"], "BC", row1_value="115年1-4月就診次數"),
+        _ensure_aux_header(ws, ["地址"], "BF", row1_value="地址"),
+        _ensure_aux_header(ws, ["114年1-4月就診次數"], "BG", row1_value="114年1-4月就診次數"),
+    }
+    for col in range(min(hidden_cols), max(hidden_cols) + 1):
+        ws.column_dimensions[get_column_letter(col)].hidden = True
 
 
 # ============================================================
@@ -4480,6 +4752,19 @@ def load_source(source_path: str) -> SourceContext:
         wb_src = _merge_source_folder(source_path)
     else:
         wb_src = _load_and_validate_source(source_path)
+    scan_cache = _scan_source_sheets(wb_src)
+    all_members = collect_all_members(wb_src, partial_maps=scan_cache.partial_maps)
+    claim_sums, claim_months_115 = collect_monthly_claim_summaries(
+        wb_src,
+        monthly_scans=scan_cache.monthly_claim_sheets,
+    )
+    claim_sums, claim_months_115 = _supplement_claim_counts_from_hisb(
+        wb_src,
+        all_members,
+        claim_sums,
+        claim_months_115,
+        hisb_scans=scan_cache.hisb_count_sheets,
+    )
     return SourceContext(
         wb_src=wb_src,
         sh_member=_first_sheet(wb_src, "會員名單", "較需要照護名單"),
@@ -4498,8 +4783,9 @@ def load_source(source_path: str) -> SourceContext:
             "fit":   _require_sheet(wb_src, "糞便潛血"),
             "hep":   _require_sheet(wb_src, "肝炎篩檢", "BC肝", "B肝C肝", "BC肝炎"),
         },
-        claim_sums=collect_monthly_claim_summaries(wb_src),
-        all_members=collect_all_members(wb_src),
+        claim_sums=claim_sums,
+        claim_months_115=claim_months_115,
+        all_members=all_members,
     )
 
 
@@ -4586,7 +4872,7 @@ def compute_derived(
     runtime_ctx: RuntimeContext,
     now: datetime.date,
     source_ctx: Optional[SourceContext] = None,
-) -> None:
+) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
     ws = template_ctx.ws
     cols = template_ctx.cols
     data_start = template_ctx.data_start
@@ -4612,9 +4898,7 @@ def compute_derived(
     )
     apply_date_format(ws, cols, data_start, last_row)
     apply_amount_format(ws, cols, data_start, last_row)
-
-    runtime_ctx.hba_candidates = hba_candidates
-    runtime_ctx.ldl_candidates = ldl_candidates
+    return hba_candidates, ldl_candidates
 
 
 def compute_kpis(
@@ -4622,6 +4906,8 @@ def compute_kpis(
     runtime_ctx: RuntimeContext,
     now: datetime.date,
     source_ctx: Optional[SourceContext] = None,
+    hba_candidates: Optional[List[Tuple[int, float]]] = None,
+    ldl_candidates: Optional[List[Tuple[int, float]]] = None,
 ) -> None:
     ws = template_ctx.ws
     cols = template_ctx.cols
@@ -4629,16 +4915,32 @@ def compute_kpis(
     last_row = runtime_ctx.last_row
 
     _log("產生 KPI 摘要與附表")
-    calc_hba_kpi_ay_az(
+    runtime_ctx.hba_main_summary, runtime_ctx.hba_target_summary = calc_hba_kpi_ay_az(
         ws, cols, data_start, last_row,
-        hba_candidates=runtime_ctx.hba_candidates,
+        hba_candidates=hba_candidates,
     )
-    calc_ldl_percentiles(
+    runtime_ctx.ldl_main_summary, runtime_ctx.ldl_target_summary = calc_ldl_percentiles(
         ws, cols, data_start, last_row,
-        ldl_candidates=runtime_ctx.ldl_candidates,
+        ldl_candidates=ldl_candidates,
+    )
+    _write_legacy_kpi_summary_cells(
+        ws,
+        hba_main_summary=runtime_ctx.hba_main_summary,
+        hba_target_summary=runtime_ctx.hba_target_summary,
+        ldl_main_summary=runtime_ctx.ldl_main_summary,
+        ldl_target_summary=runtime_ctx.ldl_target_summary,
     )
     _log("產生百分位名單")
-    populate_percentile_sheet(template_ctx.wb_tpl, ws, cols, data_start, last_row)
+    populate_percentile_sheet(
+        template_ctx.wb_tpl,
+        runtime_ctx.hba_main_summary,
+        runtime_ctx.hba_target_summary,
+        runtime_ctx.ldl_main_summary,
+        runtime_ctx.ldl_target_summary,
+        cols,
+        data_start,
+        last_row,
+    )
     _log("產生醫生看工作表")
     populate_doctor_sheet(template_ctx.wb_tpl, ws, cols, data_start, last_row, now)
     if source_ctx:
@@ -4672,6 +4974,41 @@ def _finalize_output_alignments(template_ctx: TemplateContext, runtime_ctx: Opti
         _finalize_self_select_sheet_alignment(template_ctx.wb_tpl[SELF_SELECT_SHEET_NAME])
 
 
+def trim_worksheet(ws) -> None:
+    """
+    只刪除 worksheet 尾端完全空白的列與欄。
+    判斷標準：
+    - 儲存格值為 None 或 "" 視為空白
+    - 中間的空白列/欄不動
+    - 只刪除最後一個有值儲存格之後的尾端區塊
+    """
+    last_row = 0
+    last_col = 0
+
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value not in (None, ""):
+                if cell.row > last_row:
+                    last_row = cell.row
+                if cell.column > last_col:
+                    last_col = cell.column
+
+    if last_row == 0:
+        return
+
+    if ws.max_row > last_row:
+        ws.delete_rows(last_row + 1, ws.max_row - last_row)
+
+    if ws.max_column > last_col:
+        ws.delete_cols(last_col + 1, ws.max_column - last_col)
+
+
+def trim_workbook(wb) -> None:
+    """對活頁簿中的所有工作表執行尾端空白列/欄清理。"""
+    for ws in wb.worksheets:
+        trim_worksheet(ws)
+
+
 def finalize_and_save(
     source_path: str,
     template_ctx: TemplateContext,
@@ -4684,6 +5021,7 @@ def finalize_and_save(
     base_dir = os.path.dirname(source_dir)
 
     _finalize_output_alignments(template_ctx, runtime_ctx)
+    trim_workbook(wb_tpl)
 
     for sht_name in (Rules.SHEET_TARGET, PERCENTILE_SHEET_NAME):
         if sht_name in wb_tpl.sheetnames:
@@ -4738,7 +5076,19 @@ def _sanitize_filename_component(name: str) -> str:
     name = normalize_text(name)
     if not name:
         return ""
-    return re.sub(r'[\\\\/:*?"<>|]+', "_", name)
+    return re.sub(r'[\\/:*?"<>|]+', "_", name)
+
+
+def _format_115_months_summary(months: List[int]) -> str:
+    if not months:
+        return "115年有效月份：未偵測到月份資料。"
+    if len(months) == 1:
+        month_text = f"{months[0]}月"
+    elif months == list(range(months[0], months[-1] + 1)):
+        month_text = f"{months[0]}-{months[-1]}月"
+    else:
+        month_text = "、".join(f"{m}月" for m in months)
+    return f"115年有效月份：{month_text}，共{len(months)}個月。"
 
 
 def _extract_clinic_code_from_source(source_path: str) -> Optional[str]:
@@ -4820,14 +5170,22 @@ def process_excel(source_path: str, template_path: str) -> str:
     fill_external_data(source_ctx, template_ctx, runtime_ctx)
 
     _log("計算分數、追蹤提醒與衍生欄位")
-    compute_derived(template_ctx, runtime_ctx, now, source_ctx)
+    hba_candidates, ldl_candidates = compute_derived(template_ctx, runtime_ctx, now, source_ctx)
 
     _log("計算 KPI 標記名單")
-    compute_kpis(template_ctx, runtime_ctx, now, source_ctx)
+    compute_kpis(
+        template_ctx,
+        runtime_ctx,
+        now,
+        source_ctx,
+        hba_candidates=hba_candidates,
+        ldl_candidates=ldl_candidates,
+    )
 
     _log_member_category_counts(template_ctx, runtime_ctx)
     _log("寫入輸出檔案")
     out = finalize_and_save(source_path, template_ctx, now_dt, runtime_ctx)
+    _log(_format_115_months_summary(source_ctx.claim_months_115))
     _log(f"完成輸出：{os.path.basename(out)}")
     return out
 
