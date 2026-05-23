@@ -1,0 +1,9 @@
+{
+  "python.defaultInterpreterPath": "/Users/thousand0001/PycharmProjects/clinic_merge/.venv/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "git.path": "/opt/homebrew/bin/git",
+  "code-runner.runInTerminal": true,
+  "code-runner.executorMap": {
+    "python": "/Users/thousand0001/PycharmProjects/clinic_merge/.venv/bin/python"
+  }
+}

@@ -34,9 +34,11 @@ import xml.etree.ElementTree as ET
 from copy import copy
 from dataclasses import dataclass
 from enum import Enum, auto
+from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
 import openpyxl
+import xlrd
 from odf.opendocument import load as load_ods_document
 from odf.table import Table, TableRow, TableCell
 from odf.text import P
@@ -216,8 +218,8 @@ class Rules:
     AV_OFFSET_DAYS: int = 28
     AW_OFFSET_DAYS: int = 56
 
-    # 模板設定（0327）
-    TEMPLATE_NAME: str = "選會員模板0407.xlsx"
+    # 模板設定
+    TEMPLATE_GLOB: str = "選會員模板*.xlsx"
     SHEET_TARGET: str = "會員總表"
     DATA_START_ROW: int = 3
 
@@ -259,6 +261,7 @@ class AscvdCategory(Enum):
 class MemberMeta:
     """每位會員的衍生資訊，供後續計算用"""
     row: int
+    pid: str = ""
     bday: Optional[datetime.date] = None
     age: int = -1
     e_code: Optional[DiseaseCode] = None
@@ -281,6 +284,7 @@ class SourceContext:
     claim_sums: Dict[str, Dict[str, float]]
     claim_months_115: List[int]
     all_members: Dict[str, Dict[str, Any]]
+    p4p_map: Dict[str, Dict[str, Any]]
 
 
 @dataclass
@@ -288,7 +292,7 @@ class MonthlyClaimSheetScan:
     sheet_name: str
     header_row: int
     id_col: int
-    date_col: int
+    date_col: Optional[int]
     count_col: int
     amount_col: int
 
@@ -297,9 +301,12 @@ class MonthlyClaimSheetScan:
 class HisbCountSheetScan:
     sheet_name: str
     header_row: int
+    id_col: Optional[int]
     name_col: int
-    bday_col: int
+    bday_col: Optional[int]
     count_col: int
+    date_col: Optional[int]
+    amount_col: Optional[int]
     year_bucket: int
     month: int
 
@@ -309,6 +316,71 @@ class SourceSheetScanCache:
     monthly_claim_sheets: Dict[str, MonthlyClaimSheetScan]
     hisb_count_sheets: Dict[str, HisbCountSheetScan]
     partial_maps: Dict[str, Dict[str, Dict[str, Any]]]
+
+
+class ProcessingProfile:
+    """可由診所前置器覆寫的資料讀取與辨識規則。"""
+
+    def parse_date(self, value: Any) -> Optional[datetime.date]:
+        return parse_date(value)
+
+    def load_source_workbook(self, source_path: str):
+        ext = os.path.splitext(source_path)[1].lower()
+        if ext == ".csv":
+            return _load_csv_as_workbook(source_path)
+        if ext == ".ods":
+            return _load_ods_as_workbook(source_path)
+        if ext == ".xls":
+            return self.load_xls_as_workbook(source_path)
+        return _load_xlsx_as_workbook(source_path)
+
+    def load_xls_as_workbook(self, xls_path: str):
+        return _load_xls_as_workbook(xls_path)
+
+    def canonical_source_sheet_name(
+        self,
+        sheet_name: str,
+        file_path: str,
+        single_sheet: bool,
+        src_ws: Any = None,
+    ) -> str:
+        return _canonical_source_sheet_name(sheet_name, file_path, single_sheet, src_ws)
+
+    def sheet_year_bucket(self, title: str) -> Optional[int]:
+        return _sheet_year_bucket(title)
+
+    def sheet_month(self, title: str) -> Optional[int]:
+        return _sheet_month(title)
+
+    def find_monthly_claim_header_row(self, sheet: Any, search_rows: int = 30) -> Optional[int]:
+        return _find_monthly_claim_header_row(sheet, search_rows=search_rows)
+
+    def scan_monthly_claim_sheet(self, sheet_name: str, sheet: Any) -> Optional[MonthlyClaimSheetScan]:
+        return _scan_monthly_claim_sheet(sheet_name, sheet)
+
+    def scan_hisb_count_sheet(self, sheet_name: str, sheet: Any) -> Optional[HisbCountSheetScan]:
+        return _scan_hisb_count_sheet(sheet_name, sheet, profile=self)
+
+    def collect_monthly_claim_summaries(
+        self,
+        wb_src: Any,
+        monthly_scans: Optional[Dict[str, MonthlyClaimSheetScan]] = None,
+    ) -> Tuple[Dict[str, Dict[str, float]], List[int]]:
+        return collect_monthly_claim_summaries(wb_src, monthly_scans=monthly_scans, profile=self)
+
+
+DEFAULT_PROFILE = ProcessingProfile()
+
+
+def _resolve_profile(profile: Optional[ProcessingProfile]) -> ProcessingProfile:
+    return profile or DEFAULT_PROFILE
+
+
+def _find_template(script_dir: str) -> str:
+    candidates = sorted(Path(script_dir).glob(Rules.TEMPLATE_GLOB), reverse=True)
+    if not candidates:
+        raise RuntimeError(f"找不到模板檔 {Rules.TEMPLATE_GLOB}，請確認模板放在程式同資料夾。")
+    return str(candidates[0])
 
 
 @dataclass
@@ -386,6 +458,8 @@ def normalize_phone_value(v: Any) -> Optional[str]:
     if v is None:
         return None
     digits = re.sub(r"\D+", "", str(v))
+    if len(digits) == 9 and digits.startswith("9"):
+        digits = f"0{digits}"
     if len(digits) < 8:
         return None
     return digits
@@ -413,6 +487,9 @@ def merge_contact_info(primary: Optional[ContactInfo], secondary: Optional[Conta
         mobile=p.mobile or s.mobile,
         address=p.address or s.address,
     )
+
+
+HIS_MONTHLY_FEE_FOLDER_NAME = "醫聖月份費用xlsx"
 
 
 def safe_set(ws, row: int, col: Optional[int], value: Any) -> None:
@@ -480,6 +557,7 @@ def parse_date(value: Any) -> Optional[datetime.date]:
         (r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$", False),
         (r"^(\d{2,3})(\d{2})(\d{2})$", True),
         (r"^(\d{2,3})[/-](\d{1,2})[/-](\d{1,2})$", True),
+        (r"^(\d{2,3})\.(\d{1,2})\.(\d{1,2})$", True),
     ]
     for pat, is_roc in patterns:
         m = re.match(pat, s)
@@ -509,6 +587,8 @@ def parse_disease_code(v: Any) -> Optional[DiseaseCode]:
     s = clean_spaces(v)
     if not s:
         return None
+    if re.fullmatch(r"[1-4]\.0+", s):
+        s = s.split(".", 1)[0]
     if s.isdigit():
         mapping = {
             1: DiseaseCode.DM,
@@ -1065,11 +1145,14 @@ def _find_monthly_claim_header_row(sheet, search_rows: int = 30) -> Optional[int
     這裡採用和主流程接近的邏輯：
     1. 先找出疑似 ID 欄位
     2. 再驗證下一段資料列中是否有合法身分證字號
-    3. 同時確認該列能找到日期 / 次數 / 金額欄
+    3. 同時確認該列能找到次數 / 金額欄
+       日期欄若缺少，但工作表名稱本身是 11401/11502 這類月份名稱，也視為可用
     """
     id_aliases = ["ID", "身分證號", "身分證號碼", "身份證號", "身份證號碼", "身分證字號", "身份證字號"]
     date_aliases = ["日期", "最後看診日期", "最後就診日", "最後看診日"]
     amount_aliases = ["申報總金額", "總金額", "總額", "申請金額"]
+    count_aliases = ["次數", "件數"]
+    has_sheet_month = (_sheet_year_bucket(sheet.title) in (114, 115) and _sheet_month(sheet.title) is not None)
 
     for r in range(1, min(search_rows, sheet.max_row) + 1):
         hmap = build_header_map(sheet, r)
@@ -1079,13 +1162,13 @@ def _find_monthly_claim_header_row(sheet, search_rows: int = 30) -> Optional[int
             continue
 
         date_col = find_column_exact(hmap, date_aliases)
-        count_col = find_column_exact(hmap, ["次數"])
+        count_col = find_column_exact(hmap, count_aliases)
         amount_col = None
         for alias in amount_aliases:
             amount_col = find_col_by_keywords_any_row(sheet, r, [alias])
             if amount_col:
                 break
-        if date_col and count_col and amount_col:
+        if count_col and amount_col and (date_col or has_sheet_month):
             return r
 
     return None
@@ -1095,15 +1178,18 @@ def _find_hisb_count_header_row(sheet, search_rows: int = 10) -> Optional[int]:
     """
     HIS B 次數 CSV 格式範例：
     病歷號 / 姓名 / 生日 / 電話 / 次數 / 地址
-    這類資料沒有身份證號與金額，只能用姓名+生日回對會員主表。
+    或：
+    病歷號 / 姓名 / 性別 / 身分證號 / 電話 / 次數
+    有身分證號時直接比對，沒有時才退回姓名+生日。
     """
     for r in range(1, min(search_rows, sheet.max_row) + 1):
         hmap = build_header_map(sheet, r)
         chart_col = find_column_exact(hmap, ["病歷號", "病歷號碼"])
         name_col = find_column_exact(hmap, ["姓名", "病患姓名", "會員姓名"])
-        bday_col = find_column_exact(hmap, ["生日", "出生日期", "出生年月日"])
-        count_col = find_column_exact(hmap, ["次數", "就診次數", "門診次數"])
-        if chart_col and name_col and bday_col and count_col:
+        id_col = find_column_exact(hmap, ["ID", "身分證號", "身分證號碼", "身份證號", "身份證號碼"])
+        bday_col = find_bday_column(hmap)
+        count_col = find_column_exact(hmap, ["次數", "就診次數", "門診次數", "來診次數"])
+        if chart_col and name_col and count_col and (bday_col or id_col):
             return r
     return None
 
@@ -1112,19 +1198,21 @@ def _scan_monthly_claim_sheet(sheet_name: str, sheet: Any) -> Optional[MonthlyCl
     id_aliases = ["ID", "身分證號", "身分證號碼", "身份證號", "身份證號碼", "身分證字號", "身份證字號"]
     date_aliases = ["日期", "最後看診日期", "最後就診日", "最後看診日"]
     amount_aliases = ["申報總金額", "總金額", "總額", "申請金額"]
+    count_aliases = ["次數", "件數"]
     header_row = _find_monthly_claim_header_row(sheet, search_rows=30)
     if header_row is None:
         return None
     hmap = build_header_map(sheet, header_row)
     id_col = find_id_col_by_content(sheet, header_row, find_column_exact(hmap, id_aliases))
     date_col = find_column_exact(hmap, date_aliases)
-    count_col = find_column_exact(hmap, ["次數"])
+    count_col = find_column_exact(hmap, count_aliases)
     amount_col = None
     for alias in amount_aliases:
         amount_col = find_col_by_keywords_any_row(sheet, header_row, [alias])
         if amount_col:
             break
-    if id_col is None or date_col is None or count_col is None or amount_col is None:
+    has_sheet_month = (_sheet_year_bucket(sheet_name) in (114, 115) and _sheet_month(sheet_name) is not None)
+    if id_col is None or count_col is None or amount_col is None or (date_col is None and not has_sheet_month):
         return None
     return MonthlyClaimSheetScan(
         sheet_name=sheet_name,
@@ -1136,34 +1224,49 @@ def _scan_monthly_claim_sheet(sheet_name: str, sheet: Any) -> Optional[MonthlyCl
     )
 
 
-def _scan_hisb_count_sheet(sheet_name: str, sheet: Any) -> Optional[HisbCountSheetScan]:
-    year_bucket = _sheet_year_bucket(sheet_name)
-    month = _sheet_month(sheet_name)
+def _scan_hisb_count_sheet(
+    sheet_name: str,
+    sheet: Any,
+    profile: Optional[ProcessingProfile] = None,
+) -> Optional[HisbCountSheetScan]:
+    profile = _resolve_profile(profile)
+    year_bucket = profile.sheet_year_bucket(sheet_name)
+    month = profile.sheet_month(sheet_name)
     if year_bucket not in (114, 115) or month is None:
         return None
-    if _find_monthly_claim_header_row(sheet, search_rows=10) is not None:
+    if profile.find_monthly_claim_header_row(sheet, search_rows=10) is not None:
         return None
     header_row = _find_hisb_count_header_row(sheet, search_rows=10)
     if header_row is None:
         return None
     hmap = build_header_map(sheet, header_row)
+    id_col = find_column_exact(hmap, ["ID", "身分證號", "身分證號碼", "身份證號", "身份證號碼"])
     name_col = find_column_exact(hmap, ["姓名", "病患姓名", "會員姓名"])
-    bday_col = find_column_exact(hmap, ["生日", "出生日期", "出生年月日"])
-    count_col = find_column_exact(hmap, ["次數", "就診次數", "門診次數"])
-    if not name_col or not bday_col or not count_col:
+    bday_col = find_bday_column(hmap)
+    count_col = find_column_exact(hmap, ["次數", "就診次數", "門診次數", "來診次數"])
+    date_col = find_column_exact(hmap, ["日期", "最後看診日期", "最後就診日", "最後看診日", "最後回診日"])
+    amount_col = find_column_exact(hmap, ["申報總金額", "總金額", "總額", "申請金額"])
+    if not name_col or not count_col or (not id_col and not bday_col):
         return None
     return HisbCountSheetScan(
         sheet_name=sheet_name,
         header_row=header_row,
+        id_col=id_col,
         name_col=name_col,
         bday_col=bday_col,
         count_col=count_col,
+        date_col=date_col,
+        amount_col=amount_col,
         year_bucket=year_bucket,
         month=month,
     )
 
 
-def _scan_source_sheets(wb_src) -> SourceSheetScanCache:
+def _scan_source_sheets(
+    wb_src,
+    profile: Optional[ProcessingProfile] = None,
+) -> SourceSheetScanCache:
+    profile = _resolve_profile(profile)
     id_aliases = ["身份證號", "身份證號碼", "身分證號", "身分證號碼", "身份証號", "身分証號",
                   "會員身份証", "會員身份證", "會員身分證", "ID", "家醫收案會員ID"]
     monthly_claim_sheets: Dict[str, MonthlyClaimSheetScan] = {}
@@ -1172,13 +1275,13 @@ def _scan_source_sheets(wb_src) -> SourceSheetScanCache:
 
     for sheet_name in wb_src.sheetnames:
         sh = wb_src[sheet_name]
-        monthly_scan = _scan_monthly_claim_sheet(sheet_name, sh)
+        monthly_scan = profile.scan_monthly_claim_sheet(sheet_name, sh)
         if monthly_scan is not None:
             monthly_claim_sheets[sheet_name] = monthly_scan
             partial_maps[sheet_name] = _extract_member_partial_map(sh, id_aliases, search_rows=5)
             continue
 
-        hisb_scan = _scan_hisb_count_sheet(sheet_name, sh)
+        hisb_scan = profile.scan_hisb_count_sheet(sheet_name, sh)
         if hisb_scan is not None:
             hisb_count_sheets[sheet_name] = hisb_scan
 
@@ -1192,9 +1295,25 @@ def _scan_source_sheets(wb_src) -> SourceSheetScanCache:
     )
 
 
+def _empty_claim_bucket() -> Dict[str, float]:
+    return {
+        "114_cnt": 0.0,
+        "114_cnt_full": 0.0,
+        "115_cnt": 0.0,
+        "115_cnt_q1": 0.0,
+        "114_amt": 0.0,
+        "115_amt": 0.0,
+        "114_amt_total": 0.0,
+        "115_amt_total": 0.0,
+        "115_months": 0.0,
+        "last_visit_ord": 0.0,
+    }
+
+
 def collect_monthly_claim_summaries(
     wb_src,
     monthly_scans: Optional[Dict[str, MonthlyClaimSheetScan]] = None,
+    profile: Optional[ProcessingProfile] = None,
 ) -> Tuple[Dict[str, Dict[str, float]], List[int]]:
     """
     掃描 R11440 類明細表，
@@ -1205,12 +1324,13 @@ def collect_monthly_claim_summaries(
     可兼容月份分頁與單一總表，只要列內有日期可判斷年度與月份即可。
     若某 ID 完全沒有資料，後續保持空白，不填 0。
     """
+    profile = _resolve_profile(profile)
     out: Dict[str, Dict[str, float]] = {}
     seen_115_months: set = set()
     scans = monthly_scans or {
         sheet_name: scan
         for sheet_name in wb_src.sheetnames
-        if (scan := _scan_monthly_claim_sheet(sheet_name, wb_src[sheet_name])) is not None
+        if (scan := profile.scan_monthly_claim_sheet(sheet_name, wb_src[sheet_name])) is not None
     }
 
     for sheet_name, scan in scans.items():
@@ -1221,7 +1341,7 @@ def collect_monthly_claim_summaries(
             if not pid or not is_valid_tw_id(pid):
                 continue
 
-            dt = parse_date(sh.cell(r, scan.date_col).value)
+            dt = profile.parse_date(sh.cell(r, scan.date_col).value) if scan.date_col else None
             cnt = parse_float(sh.cell(r, scan.count_col).value)
             amt = parse_float(sh.cell(r, scan.amount_col).value)
             if dt is None and cnt is None and amt is None:
@@ -1229,11 +1349,11 @@ def collect_monthly_claim_summaries(
 
             year_bucket = _roc_year_from_date(dt)
             if year_bucket not in (114, 115):
-                year_bucket = _sheet_year_bucket(sheet_name)
+                year_bucket = profile.sheet_year_bucket(sheet_name)
             if year_bucket not in (114, 115):
                 continue
 
-            month = dt.month if dt is not None else _sheet_month(sheet_name)
+            month = dt.month if dt is not None else profile.sheet_month(sheet_name)
             if month is None:
                 continue
 
@@ -1241,18 +1361,7 @@ def collect_monthly_claim_summaries(
             if year_bucket == 115 and is_q1:
                 seen_115_months.add(month)
 
-            bucket = out.setdefault(pid, {
-                "114_cnt": 0.0,
-                "114_cnt_full": 0.0,
-                "115_cnt": 0.0,
-                "115_cnt_q1": 0.0,
-                "114_amt": 0.0,
-                "115_amt": 0.0,
-                "114_amt_total": 0.0,
-                "115_amt_total": 0.0,
-                "115_months": 0.0,
-                "last_visit_ord": 0.0,
-            })
+            bucket = out.setdefault(pid, _empty_claim_bucket())
 
             if dt is not None:
                 bucket["last_visit_ord"] = max(bucket.get("last_visit_ord", 0.0), float(dt.toordinal()))
@@ -1284,6 +1393,7 @@ def _supplement_claim_counts_from_hisb(
     claim_sums: Dict[str, Dict[str, float]],
     claim_months_115: List[int],
     hisb_scans: Optional[Dict[str, HisbCountSheetScan]] = None,
+    profile: Optional[ProcessingProfile] = None,
 ) -> Tuple[Dict[str, Dict[str, float]], List[int]]:
     """
     補吃 HIS B 的「次數 CSV」：
@@ -1291,6 +1401,7 @@ def _supplement_claim_counts_from_hisb(
     - 只有次數，沒有身份證號/日期/金額
     - 用 姓名 + 生日 唯一比對到會員 ID 後，將次數累加到月份統計
     """
+    profile = _resolve_profile(profile)
     member_key_to_ids: Dict[Tuple[str, datetime.date], List[str]] = {}
     for pid, info in all_members.items():
         name = normalize_text(info.get("name"))
@@ -1304,49 +1415,64 @@ def _supplement_claim_counts_from_hisb(
     scans = hisb_scans or {
         sheet_name: scan
         for sheet_name in wb_src.sheetnames
-        if (scan := _scan_hisb_count_sheet(sheet_name, wb_src[sheet_name])) is not None
+        if (scan := profile.scan_hisb_count_sheet(sheet_name, wb_src[sheet_name])) is not None
     }
 
     for sheet_name, scan in scans.items():
         sh = wb_src[sheet_name]
         is_q1 = scan.month <= 4
+        has_any_data = False
         matched_any_115 = False
         for r in range(scan.header_row + 1, sh.max_row + 1):
-            name = normalize_text(sh.cell(r, scan.name_col).value)
-            bday = parse_date(sh.cell(r, scan.bday_col).value)
             cnt = parse_float(sh.cell(r, scan.count_col).value)
-            if not name or not isinstance(bday, datetime.date) or cnt is None:
+            dt = profile.parse_date(sh.cell(r, scan.date_col).value) if scan.date_col else None
+            amt = parse_float(sh.cell(r, scan.amount_col).value) if scan.amount_col else None
+            if cnt is None and dt is None and amt is None:
                 continue
+            has_any_data = True
 
-            matched_ids = member_key_to_ids.get((name, bday), [])
+            matched_ids: List[str] = []
+            if scan.id_col:
+                pid = normalize_id(sh.cell(r, scan.id_col).value)
+                if pid and is_valid_tw_id(pid):
+                    matched_ids = [pid]
+
+            if not matched_ids and scan.bday_col:
+                name = normalize_text(sh.cell(r, scan.name_col).value)
+                bday = profile.parse_date(sh.cell(r, scan.bday_col).value)
+                if not name or not isinstance(bday, datetime.date):
+                    continue
+                matched_ids = member_key_to_ids.get((name, bday), [])
+
             if len(matched_ids) != 1:
                 continue
 
             pid = matched_ids[0]
-            bucket = claim_sums.setdefault(pid, {
-                "114_cnt": 0.0,
-                "114_cnt_full": 0.0,
-                "115_cnt": 0.0,
-                "115_cnt_q1": 0.0,
-                "114_amt": 0.0,
-                "115_amt": 0.0,
-                "114_amt_total": 0.0,
-                "115_amt_total": 0.0,
-                "115_months": 0.0,
-                "last_visit_ord": 0.0,
-            })
+            bucket = claim_sums.setdefault(pid, _empty_claim_bucket())
 
-            if scan.year_bucket == 115:
-                bucket["115_cnt"] += cnt
-                if is_q1:
-                    bucket["115_cnt_q1"] += cnt
-                    matched_any_115 = True
-            else:
-                bucket["114_cnt_full"] += cnt
-                if is_q1:
-                    bucket["114_cnt"] += cnt
+            if dt is not None:
+                bucket["last_visit_ord"] = max(bucket.get("last_visit_ord", 0.0), float(dt.toordinal()))
 
-        if scan.year_bucket == 115 and is_q1 and matched_any_115:
+            if cnt is not None:
+                if scan.year_bucket == 115:
+                    bucket["115_cnt"] += cnt
+                    if is_q1:
+                        bucket["115_cnt_q1"] += cnt
+                else:
+                    bucket["114_cnt_full"] += cnt
+                    if is_q1:
+                        bucket["114_cnt"] += cnt
+
+            if amt is not None:
+                prefix = str(scan.year_bucket)
+                if is_q1:
+                    bucket[f"{prefix}_amt"] += amt
+                bucket[f"{prefix}_amt_total"] += amt
+
+            if scan.year_bucket == 115 and is_q1:
+                matched_any_115 = True
+
+        if scan.year_bucket == 115 and is_q1 and (matched_any_115 or has_any_data):
             seen_115_months.add(scan.month)
 
     month_count_115 = float(len(seen_115_months))
@@ -1382,6 +1508,7 @@ def fill_monthly_claim_summary_columns(
     last_row: int,
     cols: Dict[str, Optional[int]],
     claim_sums: Dict[str, Dict[str, float]],
+    meta: Optional[Dict[int, MemberMeta]] = None,
 ) -> None:
     col_last = cols.get("last_visit")            # K：最後就診日
     col_m    = cols.get("m_count_114")            # L：114全年件數
@@ -1390,11 +1517,17 @@ def fill_monthly_claim_summary_columns(
     col_o    = cols.get("n_count_115")            # N：115件數（有效月份總次數）
     col_s    = cols.get("r_amount_114")           # M：114實際申報總額（總額）
     col_t    = cols.get("s_amount_115")           # O：115實際申報總額（總額）
+    col_bd   = cols.get("avg_amount_114_hidden")  # BD：114年月平均（隱藏輔助欄）
+    col_be   = cols.get("avg_amount_115_hidden")  # BE：115年月平均（隱藏輔助欄）
     if not all([col_m, col_o, col_s, col_t, cols.get("id")]):
         raise ValueError("模板找不到 L/M/N/O 或 ID 欄位，無法填入月份申請統計")
 
     for rr in range(data_start, last_row + 1):
-        pid = normalize_text(ws.cell(rr, cols["id"]).value).upper()  # type: ignore[index]
+        pid = ""
+        if meta is not None:
+            pid = normalize_text(meta.get(rr, MemberMeta(row=rr)).pid).upper()
+        if not pid:
+            pid = normalize_text(ws.cell(rr, cols["id"]).value).upper()  # type: ignore[index]
         data = claim_sums.get(pid)
 
         if not data:
@@ -1408,6 +1541,10 @@ def fill_monthly_claim_summary_columns(
             ws.cell(rr, col_o).value = None
             ws.cell(rr, col_s).value = None
             ws.cell(rr, col_t).value = None
+            if col_bd:
+                ws.cell(rr, col_bd).value = None
+            if col_be:
+                ws.cell(rr, col_be).value = None
             continue
 
         v114c    = data.get("114_cnt", 0.0)
@@ -1418,6 +1555,7 @@ def fill_monthly_claim_summary_columns(
         v115a    = data.get("115_amt", 0.0)
         v114a_total = data.get("114_amt_total", 0.0)
         v115a_total = data.get("115_amt_total", 0.0)
+        v115_months = max(int(data.get("115_months", 0.0)), 1)
         last_visit_ord = int(data.get("last_visit_ord", 0.0) or 0)
 
         if col_last:
@@ -1432,6 +1570,12 @@ def fill_monthly_claim_summary_columns(
         ws.cell(rr, col_o).value = _to_excel_number(v115c) if v115c != 0 else None
         ws.cell(rr, col_s).value = _to_excel_int(v114a_total) if v114a_total != 0 else None
         ws.cell(rr, col_t).value = _to_excel_int(v115a_total) if v115a_total != 0 else None
+        if col_bd:
+            avg_114 = (v114a_total / 12.0) if v114a_total != 0 else None
+            ws.cell(rr, col_bd).value = _to_excel_int(avg_114)
+        if col_be:
+            avg_115 = (v115a / float(v115_months)) if v115a != 0 else None
+            ws.cell(rr, col_be).value = _to_excel_int(avg_115)
 
 
 # ============================================================
@@ -1447,6 +1591,23 @@ def adult_check_interval_years(age: int, e_code: Optional[DiseaseCode] = None) -
     if age >= 65:
         return 1
     return None
+
+
+def adult_screening_status(
+    age: int,
+    e_code: Optional[DiseaseCode] = None,
+) -> Tuple[bool, Optional[str], PatternFill]:
+    """
+    成人健檢狀態單一規則來源：
+    - DM/CKD/DKD：不需檢查，且顯示排除個案文字
+    - 其餘：依 adult_check_interval_years() 判斷是否需要
+    """
+    interval = adult_check_interval_years(age, e_code)
+    if interval is None:
+        if e_code in (DiseaseCode.DM, DiseaseCode.CKD, DiseaseCode.DKD):
+            return False, "為DM/CKD/DKD排除個案", _FILL_SCREENING_EXCLUDED
+        return False, "不需受檢", _FILL_NONE
+    return True, "待受檢", _FILL_SCREENING_PENDING
 
 
 def pap_check_interval_years(age: int, sex: str) -> Optional[int]:
@@ -1468,7 +1629,7 @@ def need_fit(age: int) -> bool:
 
 
 def need_bc_hep(age: int) -> bool:
-    return 45 <= age <= 80
+    return 45 <= age < 80
 
 
 # ============================================================
@@ -1487,6 +1648,14 @@ def find_column_exact(hmap: Dict[str, int], aliases: List[str]) -> Optional[int]
     for a in aliases:
         if a in hmap:
             return hmap[a]
+    return None
+
+
+def find_bday_column(hmap: Dict[str, int]) -> Optional[int]:
+    for hdr, col in hmap.items():
+        hdr_upper = hdr.upper()
+        if "生日" in hdr or "出生" in hdr or "BIRTHDAY" in hdr_upper:
+            return col
     return None
 
 
@@ -1678,6 +1847,10 @@ def _detect_output_cols(ws, header_row: int, max_scan_row: int) -> Dict[str, Opt
         "s_amount_115":   (kw(ws, header_row, ["115年", "實際申報總額"])
                            or kw(ws, header_row, ["115年", "申報總額"])
                            or kw(ws, header_row, ["115年", "申報金額", "月"])),
+        "avg_amount_114_hidden": (kw(ws, header_row, ["114年月平均"])
+                                  or kw(ws, header_row, ["114年", "月平均"])),
+        "avg_amount_115_hidden": (kw(ws, header_row, ["115年月平均"])
+                                  or kw(ws, header_row, ["115年", "月平均"])),
         "address_hidden": kw(ws, header_row, ["地址"]),
     }
 
@@ -2066,10 +2239,16 @@ def _score_prevention(
     age: int,
     sex: str,
     adult_dt: Optional[datetime.date],
+    adult_in_list: bool,
     pap_dt: Optional[datetime.date],
+    pap_in_list: bool,
     flu_dt: Optional[datetime.date],
+    flu_in_list: bool,
     fit_dt: Optional[datetime.date],
+    fit_in_list: bool,
     hep_dt: Optional[datetime.date],
+    hep_in_list: bool,
+    today: datetime.date,
 ) -> int:
     sex = normalize_text(sex)
     if age < 0:
@@ -2087,49 +2266,69 @@ def _score_prevention(
             score -= points
 
     adult_interval = adult_check_interval_years(age, e_code)
+    adult_ok = _screening_status_by_rule(
+        "adult", in_screening_list=adult_in_list, dt=adult_dt,
+        age=age, e_code=e_code, sex=sex, today=today,
+    ) in ("not_needed", "done")
+    pap_ok = _screening_status_by_rule(
+        "pap", in_screening_list=pap_in_list, dt=pap_dt,
+        age=age, e_code=e_code, sex=sex, today=today,
+    ) in ("not_needed", "done")
+    flu_ok = _screening_status_by_rule(
+        "flu", in_screening_list=flu_in_list, dt=flu_dt,
+        age=age, e_code=e_code, sex=sex, today=today,
+    ) in ("not_needed", "done")
+    fit_ok = _screening_status_by_rule(
+        "fit", in_screening_list=fit_in_list, dt=fit_dt,
+        age=age, e_code=e_code, sex=sex, today=today,
+    ) in ("not_needed", "done")
+    hep_ok = _screening_status_by_rule(
+        "hep", in_screening_list=hep_in_list, dt=hep_dt,
+        age=age, e_code=e_code, sex=sex, today=today,
+    ) in ("not_needed", "done")
 
     if sex == "男":
         if 30 <= age <= 39:
             if adult_interval:
-                deduct(_done_in_years(adult_dt, years_110_115), 6)
+                deduct(adult_ok, 6)
         elif 40 <= age <= 64:
             if adult_interval:
-                deduct(_done_in_years(adult_dt, years_112_115), 6)
+                deduct(adult_ok, 6)
         elif age >= 65:
             if adult_interval:
-                deduct(_done_in_years(adult_dt, year_115), 6)
+                deduct(adult_ok, 6)
 
         if 45 <= age <= 75:
-            deduct(_done_in_years(fit_dt, years_113_115), 6)
-        if age >= 45:
-            deduct(_ever_done(hep_dt), 6)
+            deduct(fit_ok, 6)
+        if 45 <= age < 80:
+            deduct(hep_ok, 6)
         if age >= 65:
-            deduct(_done_in_years(flu_dt, year_115), 4)
+            deduct(flu_ok, 4)
 
     elif sex == "女":
         if 25 <= age <= 29:
-            deduct(_done_in_years(pap_dt, years_112_115), 6)
+            deduct(pap_ok, 6)
             if adult_interval:
-                deduct(_done_in_years(adult_dt, years_110_115), 6)
+                deduct(adult_ok, 6)
         elif 30 <= age <= 39:
-            deduct(_done_in_years(pap_dt, year_115), 6)
+            deduct(pap_ok, 6)
             if adult_interval:
-                deduct(_done_in_years(adult_dt, years_110_115), 6)
+                deduct(adult_ok, 6)
         elif 40 <= age <= 64:
-            deduct(_done_in_years(pap_dt, year_115), 6)
+            deduct(pap_ok, 6)
             if adult_interval:
-                deduct(_done_in_years(adult_dt, years_112_115), 6)
+                deduct(adult_ok, 6)
         elif age >= 65:
-            deduct(_done_in_years(pap_dt, year_115), 6)
+            deduct(pap_ok, 6)
             if adult_interval:
-                deduct(_done_in_years(adult_dt, year_115), 6)
+                deduct(adult_ok, 6)
 
         if 45 <= age <= 75:
-            deduct(_done_in_years(fit_dt, years_113_115), 6)
-        if age >= 45:
-            deduct(_ever_done(hep_dt), 6)
+            deduct(fit_ok, 6)
+        if 45 <= age < 80:
+            deduct(hep_ok, 6)
         if age >= 65:
-            deduct(_done_in_years(flu_dt, year_115), 4)
+            deduct(flu_ok, 4)
 
     return max(score, 0)
 
@@ -2142,7 +2341,7 @@ def _score_hba_management(
 ) -> int:
     if e_code not in (DiseaseCode.DM, DiseaseCode.DKD):
         return 5 if e_code in (DiseaseCode.CKD, DiseaseCode.OTHER) else 0
-    if not isinstance(hba_dt, datetime.date) or hba_dt.year not in (2025, 2026):
+    if not isinstance(hba_dt, datetime.date) or hba_dt.year < 2026:
         return 0
     v = parse_float(hba_val)
     if v is None or age < 0:
@@ -2156,7 +2355,7 @@ def _score_ldl_management(
     ldl_val: Any,
     ldl_dt: Optional[datetime.date],
 ) -> int:
-    if not isinstance(ldl_dt, datetime.date) or ldl_dt.year not in (2025, 2026):
+    if not isinstance(ldl_dt, datetime.date) or ldl_dt.year < 2026:
         return 0
     v = parse_float(ldl_val)
     if v is None:
@@ -2205,18 +2404,32 @@ def calc_score(
     ldl_val:  Any,
     ldl_dt:   Optional[datetime.date],
     adult_dt: Optional[datetime.date],
+    adult_in_list: bool,
     pap_dt:   Optional[datetime.date],
+    pap_in_list: bool,
     flu_dt:   Optional[datetime.date],
+    flu_in_list: bool,
     fit_dt:   Optional[datetime.date],
+    fit_in_list: bool,
     hep_dt:   Optional[datetime.date],
+    hep_in_list: bool,
     age:      int,
     sex:      str,
+    today:    datetime.date,
     claim_amount_114: Any,
     claim_amount_115: Any,
     visit_count_114: Any,
     visit_count_115: Any,
 ) -> Tuple[int, str]:
-    prevention_total = _score_prevention(e_code, age, sex, adult_dt, pap_dt, flu_dt, fit_dt, hep_dt)
+    prevention_total = _score_prevention(
+        e_code, age, sex,
+        adult_dt, adult_in_list,
+        pap_dt, pap_in_list,
+        flu_dt, flu_in_list,
+        fit_dt, fit_in_list,
+        hep_dt, hep_in_list,
+        today,
+    )
     fee_score = _score_fee(claim_amount_114, claim_amount_115)
     exam_score = _score_management_total(e_code, ascvd_raw, age, hba_val, hba_dt, ldl_val, ldl_dt)
     visit_score = _score_visit_count(visit_count_115, visit_count_114)
@@ -2570,10 +2783,12 @@ def _copy_sheet_rows(
     dst_data_start: int = 3,
     filter_ids: Optional[set] = None,
     id_main_col: Optional[int] = None,
+    filter_check_col: Optional[int] = None,
 ) -> int:
     """
     通用：把 ws_main 的資料按 col_map 逐列 copy 到 ws_out。
     filter_ids: 若指定，只 copy ID 在此 set 內的列。
+    filter_check_col: 若指定，只 copy 該欄值為勾選的列。
     回傳實際寫入列數。
     """
     # 清空目標舊資料
@@ -2588,6 +2803,9 @@ def _copy_sheet_rows(
     ]
     dst_row = dst_data_start
     for src_row in range(data_start, last_row + 1):
+        if filter_check_col:
+            if normalize_text(ws_main.cell(src_row, filter_check_col).value) not in ("✔", "v", "V"):
+                continue
         # 過濾 ID
         if filter_ids is not None:
             pid = normalize_id(ws_main.cell(src_row, id_main_col).value) if id_main_col else ""
@@ -2648,13 +2866,13 @@ _DOCTOR_COL_MAP: List[Tuple[str, str]] = [
     # K = 總表 L = 114全年就診次數
     # L = 總表隱藏輔助欄 BG = 114年1-4月就診次數
     # M = 總表 N = 115年有效月份總就診次數
-    # N = 總表 M = 114全年申報總金額
-    # O = 總表 O = 115年申報總金額
+    # N = 總表隱藏輔助欄 BD = 114年月平均費用
+    # O = 總表隱藏輔助欄 BE = 115年有效月平均費用
     ("m_count_114", "K"),
     ("m_count_114_q1", "L"),
     ("n_count_115", "M"),
-    ("r_amount_114", "N"),
-    ("s_amount_115", "O"),
+    ("avg_amount_114_hidden", "N"),
+    ("avg_amount_115_hidden", "O"),
     ("adult", "P"),
     ("pap", "Q"),
     ("flu", "R"),
@@ -2707,9 +2925,8 @@ def _doctor_screening_status(
     sex: str,
 ) -> Tuple[str, PatternFill]:
     if kind == "adult":
-        if e_code in (DiseaseCode.DM, DiseaseCode.CKD, DiseaseCode.DKD):
-            return "為DM/CKD/DKD排除個案", _FILL_SCREENING_EXCLUDED
-        needed = adult_check_interval_years(age, e_code) is not None
+        _, status_text, status_fill = adult_screening_status(age, e_code)
+        return status_text or "不需受檢", status_fill
     elif kind == "pap":
         needed = pap_check_interval_years(age, sex) is not None
     elif kind == "flu":
@@ -2724,6 +2941,67 @@ def _doctor_screening_status(
     if needed:
         return "待受檢", _FILL_SCREENING_PENDING
     return "不需受檢", _FILL_NONE
+
+
+def _screening_needed(
+    kind: str,
+    *,
+    age: int,
+    e_code: Optional[DiseaseCode] = None,
+    sex: str,
+) -> bool:
+    if kind == "adult":
+        return adult_check_interval_years(age, e_code) is not None
+    if kind == "pap":
+        return pap_check_interval_years(age, sex) is not None
+    if kind == "flu":
+        return need_flu(age)
+    if kind == "fit":
+        return need_fit(age)
+    if kind == "hep":
+        return need_bc_hep(age)
+    return False
+
+
+def _screening_status_by_rule(
+    kind: str,
+    *,
+    in_screening_list: bool,
+    dt: Optional[datetime.date],
+    age: int,
+    e_code: Optional[DiseaseCode] = None,
+    sex: str,
+    today: datetime.date,
+) -> str:
+    if not _screening_needed(kind, age=age, e_code=e_code, sex=sex):
+        return "not_needed"
+    if not in_screening_list:
+        return "uncertain"
+    if dt is None:
+        return "pending"
+    if _doctor_screening_is_overdue(kind, dt=dt, age=age, e_code=e_code, sex=sex, today=today):
+        return "overdue"
+    return "done"
+
+
+def _doctor_screening_display_from_status(
+    *,
+    status: str,
+    dt: Optional[datetime.date],
+) -> Tuple[str, PatternFill]:
+    if status == "not_needed":
+        return "不需受檢", _FILL_NONE
+    if status == "uncertain":
+        return "不確定(主動確認+補做機會)", _FILL_NONE
+    if status == "done" and dt is not None:
+        return dt.strftime("%Y-%m-%d"), _FILL_DOCTOR_DATE_DONE
+    if status == "overdue":
+        return "過期需受檢", _FILL_SCREENING_PENDING
+    return "待受檢", _FILL_SCREENING_PENDING
+
+
+def _doctor_unknown_age_display() -> Tuple[str, PatternFill]:
+    return "年齡未知", _FILL_NONE
 
 
 def _doctor_screening_is_overdue(
@@ -2873,6 +3151,8 @@ def populate_doctor_sheet(
     data_start: int,
     last_row: int,
     today: Optional[datetime.date] = None,
+    screening_member_ids: Optional[Dict[str, set[str]]] = None,
+    p4p_map: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
     if DOCTOR_SHEET_NAME not in wb_tpl.sheetnames:
         return
@@ -2888,6 +3168,22 @@ def populate_doctor_sheet(
         dst_data_start=4,
     )
     today = today or datetime.date.today()
+    ws_doc["P3"] = (
+        "各項預防保健計分原則：\n"
+        "老人流感：4 分、其餘各項：6 分\n"
+        "醫生看 P-T 顯示：\n"
+        "年齡未知 → 年齡未知\n"
+        "不符合篩檢條件 → 不需受檢\n"
+        "符合條件且在名單內：\n"
+        "有日期且未過期 → 顯示日期\n"
+        "已過期 → 過期需受檢\n"
+        "沒日期 → 待受檢\n"
+        "符合條件但不在預防保健名單內：\n"
+        "不確定(主動確認+補做機會)\n"
+        "給分條件：\n"
+        "不符合篩檢條件、有日期且沒過期 → 給分\n"
+        "沒篩檢過、過期需受檢、不在預防保健名單內 → 不給分"
+    )
     for col_letter in ("P", "Q", "R", "S", "T"):
         ws_doc.column_dimensions[col_letter].width = max(
             ws_doc.column_dimensions[col_letter].width or 0,
@@ -2897,6 +3193,7 @@ def populate_doctor_sheet(
     breakdown_col = cols.get("breakdown")
     age_col = cols.get("age")
     sex_col = cols.get("sex")
+    id_col = cols.get("id")
     abc_col = cols.get("abc")
     disease_text_col = cols.get("disease_text")
     hba_pass_col = cols.get("ak")
@@ -2915,16 +3212,29 @@ def populate_doctor_sheet(
         ascvd_raw = ws_main.cell(src_row, cols["ascvd"]).value
         age_val = ws_main.cell(src_row, age_col).value if age_col else None
         sex_val = normalize_text(ws_main.cell(src_row, sex_col).value) if sex_col else ""
+        pid_val = normalize_id(ws_main.cell(src_row, id_col).value) if id_col else ""
         abc_val = normalize_text(ws_main.cell(src_row, abc_col).value) if abc_col else ""
         disease_text_val = normalize_text(ws_main.cell(src_row, disease_text_col).value) if disease_text_col else ""
         leak_item_val = normalize_text(ws_main.cell(src_row, leak_item_col).value) if leak_item_col else ""
+        p4p_records = (p4p_map or {}).get(pid_val, {}).get("records", []) if pid_val else []
         ws_doc[f"D{offset}"] = age_val
         ws_doc[f"H{offset}"] = _doctor_dmk_display(e_code, raw_dmk_value)
         ws_doc[f"I{offset}"] = _doctor_ascvd_display(ascvd_raw)
+        if p4p_records:
+            ws_doc[f"AB{offset}"] = format_p4p_record_display(p4p_records[0])
+            for extra_idx, record in enumerate(p4p_records[1:], start=0):
+                ws_doc.cell(offset, column_index_from_string("AT") + extra_idx).value = format_p4p_record_display(record)
+        else:
+            p4p_status = normalize_text(ws_doc[f"AB{offset}"].value)
+            p4p_plan = normalize_text(ws_main.cell(src_row, cols["p4p_plan"]).value) if cols.get("p4p_plan") else ""
+            if p4p_status and p4p_plan:
+                ws_doc[f"AB{offset}"] = f"{p4p_status}({p4p_plan})"
         ws_doc[f"AJ{offset}"] = visit_score
         ws_doc[f"AK{offset}"] = fee_score
         ws_doc[f"AL{offset}"] = exam_score
         ws_doc[f"AM{offset}"] = prevention_score
+        if e_code in (DiseaseCode.DM, DiseaseCode.CKD, DiseaseCode.DKD):
+            ws_doc[f"AP{offset}"] = None
 
         age_num = _safe_int(age_val)
         for col_letter, kind in (
@@ -2935,19 +3245,31 @@ def populate_doctor_sheet(
             ("T", "hep"),
         ):
             cell = ws_doc[f"{col_letter}{offset}"]
+            cell.font = copy(cell.font)
             dt = parse_date(cell.value)
-            if dt is not None:
-                if _doctor_screening_is_overdue(kind, dt=dt, age=age_num, e_code=e_code, sex=sex_val, today=today):
-                    cell.value = f"{dt.strftime('%Y-%m-%d')}\n(過期待受檢)"
-                    cell.fill = _FILL_SCREENING_NOT_NEEDED
+            if age_val in (None, ""):
+                status_text, status_fill = _doctor_unknown_age_display()
+                cell.value = status_text
+                cell.fill = status_fill
+                cell.font = doctor_alert_font
+                cell.border = _BORDER_THIN_GRAY
                 continue
-            if cell.value not in (None, ""):
-                continue
-            status_text, status_fill = _doctor_screening_status(kind, age=age_num, e_code=e_code, sex=sex_val)
+            in_screening_list = bool(
+                pid_val and screening_member_ids and pid_val in screening_member_ids.get(kind, set())
+            )
+            status = _screening_status_by_rule(
+                kind,
+                in_screening_list=in_screening_list,
+                dt=dt,
+                age=age_num,
+                e_code=e_code,
+                sex=sex_val,
+                today=today,
+            )
+            status_text, status_fill = _doctor_screening_display_from_status(status=status, dt=dt)
             cell.value = status_text
             cell.fill = status_fill
             cell.border = _BORDER_THIN_GRAY
-            continue
 
         for col_letter in ("P", "Q", "R", "S", "T"):
             ws_doc[f"{col_letter}{offset}"].border = _BORDER_THIN_GRAY
@@ -3064,7 +3386,7 @@ _SELF_SELECT_COL_MAP: List[Tuple[str, str]] = [
     ("name", "A"),
     ("id", "B"),
     ("m_count_114", "C"),
-    ("m_count_114", "D"),
+    ("m_count_114_q1", "D"),
     ("n_count_115", "E"),
     ("r_amount_114", "F"),
     ("s_amount_115", "G"),
@@ -3084,6 +3406,14 @@ _SELF_SELECT_COL_MAP: List[Tuple[str, str]] = [
     ("is_114", "U"),
 ]
 
+_SELF_SELECT_HIDDEN_SCORE_COLS: List[Tuple[str, str]] = [
+    ("total_score", "V"),
+    ("visit_score", "W"),
+    ("fee_score", "X"),
+    ("exam_score", "Y"),
+    ("prevention_score", "Z"),
+]
+
 
 def populate_self_select_sheet(
     wb_tpl,
@@ -3095,34 +3425,54 @@ def populate_self_select_sheet(
 ) -> None:
     if SELF_SELECT_SHEET_NAME not in wb_tpl.sheetnames:
         return
-    if sh_self_select is None:
-        return
 
-    # 建立自選名單的 ID set
-    id_aliases = ["身份證號", "身份證號碼", "身分證號", "身分證號碼", "ID", "身份証號"]
-    header_row = _find_header_row_contains_any(sh_self_select, [id_aliases], search_rows=10)
-    if header_row is None:
-        header_row = 1
-    hmap = build_header_map(sh_self_select, header_row)
-    id_col = find_id_col_by_content(sh_self_select, header_row, find_column_exact(hmap, id_aliases))
-    if id_col is None:
-        print("自選名單 sheet 找不到 ID 欄，略過")
+    self_select_col = cols.get("is_self_select")
+    if not self_select_col:
+        print("自選名單 sheet 找不到主表自選欄，略過")
         return
-
-    self_select_ids: set = {
-        normalize_id(sh_self_select.cell(r, id_col).value)
-        for r in range(header_row + 1, sh_self_select.max_row + 1)
-        if is_valid_tw_id(sh_self_select.cell(r, id_col).value)
-    }
 
     src_col_map = _build_src_col_map(_SELF_SELECT_COL_MAP, cols)
     ws_out = wb_tpl[SELF_SELECT_SHEET_NAME]
     n = _copy_sheet_rows(
         ws_main, ws_out, _SELF_SELECT_COL_MAP, src_col_map,
         data_start, last_row,
-        filter_ids=self_select_ids,
-        id_main_col=cols.get("id"),
+        filter_check_col=self_select_col,
     )
+
+    score_col = cols.get("score")
+    breakdown_col = cols.get("breakdown")
+    hidden_col_indexes = {
+        key: column_index_from_string(letter)
+        for key, letter in _SELF_SELECT_HIDDEN_SCORE_COLS
+    }
+
+    for key, letter in _SELF_SELECT_HIDDEN_SCORE_COLS:
+        ws_out.column_dimensions[letter].hidden = True
+
+    ws_out.cell(2, hidden_col_indexes["total_score"]).value = "分數"
+    ws_out.cell(2, hidden_col_indexes["visit_score"]).value = "固定就診次數"
+    ws_out.cell(2, hidden_col_indexes["fee_score"]).value = "醫療費用"
+    ws_out.cell(2, hidden_col_indexes["exam_score"]).value = "糖心腎管理"
+    ws_out.cell(2, hidden_col_indexes["prevention_score"]).value = "預防保健"
+
+    dst_row = 3
+    for src_row in range(data_start, last_row + 1):
+        if normalize_text(ws_main.cell(src_row, self_select_col).value) not in ("✔", "v", "V"):
+            continue
+
+        visit_score = fee_score = exam_score = prevention_score = None
+        if breakdown_col:
+            visit_score, fee_score, exam_score, prevention_score = _extract_score_components(
+                ws_main.cell(src_row, breakdown_col).value
+            )
+
+        ws_out.cell(dst_row, hidden_col_indexes["total_score"]).value = ws_main.cell(src_row, score_col).value if score_col else None
+        ws_out.cell(dst_row, hidden_col_indexes["visit_score"]).value = visit_score
+        ws_out.cell(dst_row, hidden_col_indexes["fee_score"]).value = fee_score
+        ws_out.cell(dst_row, hidden_col_indexes["exam_score"]).value = exam_score
+        ws_out.cell(dst_row, hidden_col_indexes["prevention_score"]).value = prevention_score
+        dst_row += 1
+
     print(f"自選名單 sheet 已寫入 {n} 列")
 
 
@@ -3138,7 +3488,7 @@ def _finalize_main_sheet_alignment(ws, data_start: int, last_row: int) -> None:
 
 
 def _finalize_self_select_sheet_alignment(ws) -> None:
-    end_col = column_index_from_string("U")
+    end_col = column_index_from_string("Z")
     for row in range(3, ws.max_row + 1):
         for col in range(1, end_col + 1):
             ws.cell(row, col).alignment = _get_alignment("center", wrap_text=True)
@@ -3459,7 +3809,8 @@ def _extract_member_partial_map(
     data_start_row = _first_valid_id_row(sheet, id_col, header_row)
 
     name_col = find_column_exact(hmap, ["會員姓名", "姓名", "名字"])
-    bday_col = find_column_exact(hmap, ["會員生日", "生日", "出生日期", "生日日期", "出生年月日"])
+    bday_col = find_bday_column(hmap)
+    dmk_col = find_column_exact(hmap, ["疾病樣態"])
     ascvd_col = find_column_exact(hmap, ["ASCVD", "ascvd"])
     phone_cols = [
         c for hdr, c in hmap.items()
@@ -3481,6 +3832,10 @@ def _extract_member_partial_map(
             _fill_member_field(rec, "name", normalize_text(sheet.cell(r, name_col).value))
         if bday_col:
             _fill_member_field(rec, "bday", parse_date(sheet.cell(r, bday_col).value))
+        if dmk_col:
+            dmk_val = sheet.cell(r, dmk_col).value
+            _fill_member_field(rec, "e_code", parse_disease_code(dmk_val))
+            _fill_member_field(rec, "dmk_raw", dmk_val)
         if ascvd_col:
             ascvd_val = sheet.cell(r, ascvd_col).value
             if ascvd_val is not None and str(ascvd_val).strip() != "":
@@ -3493,6 +3848,85 @@ def _extract_member_partial_map(
             _fill_member_field(rec, "address", normalize_text(sheet.cell(r, addr_col).value) or None)
 
     return result
+
+
+def _iter_member_union_keys(rec: Dict[str, Any]) -> List[Tuple[str, str]]:
+    name = clean_spaces(rec.get("name")).upper()
+    if not name:
+        return []
+
+    keys: List[Tuple[str, str]] = []
+    bday = rec.get("bday")
+    if isinstance(bday, datetime.date):
+        keys.append(("name_bday", f"{name}|BDAY|{bday.strftime('%Y-%m-%d')}"))
+
+    for raw in (rec.get("phone"), rec.get("mobile")):
+        phone = normalize_phone_value(raw)
+        if phone and len(phone) >= 7:
+            keys.append(("name_phone", f"{name}|PHONE|{phone[-7:]}"))
+
+    keys.append(("name_only", name))
+    return list(dict.fromkeys(keys))
+
+
+def _extract_member_noid_rows(
+    sheet,
+    id_aliases: List[str],
+    search_rows: int = 10,
+) -> List[Dict[str, Any]]:
+    if sheet is None:
+        return []
+
+    id_col, header_row = _find_sheet_id_col(sheet, id_aliases, search_rows=search_rows)
+    if id_col is not None:
+        return []
+
+    hmap = build_header_map(sheet, header_row)
+    name_col = find_column_exact(hmap, ["會員姓名", "姓名", "名字"])
+    if not name_col:
+        return []
+
+    bday_col = find_bday_column(hmap)
+    ascvd_col = find_column_exact(hmap, ["ASCVD", "ascvd"])
+    abc_col = find_column_exact(hmap, ["會員別"])
+    dmk_col = find_column_exact(hmap, ["疾病樣態"])
+    cnt_col = find_column_exact(hmap, ["就診次數"])
+    phone_cols = [c for hdr, c in hmap.items() if c != name_col and is_phone_header(hdr)]
+    addr_col = next((c for hdr, c in hmap.items() if c != name_col and is_address_header(hdr)), None)
+    clinic_val = normalize_text(sheet.cell(1, 1).value)
+
+    out: List[Dict[str, Any]] = []
+    for r in range(header_row + 1, sheet.max_row + 1):
+        name = normalize_text(sheet.cell(r, name_col).value) if name_col else ""
+        if not name:
+            continue
+        rec = _empty_member()
+        rec["name"] = name
+        if bday_col:
+            rec["bday"] = parse_date(sheet.cell(r, bday_col).value)
+        if abc_col:
+            rec["abc"] = sheet.cell(r, abc_col).value
+        if dmk_col:
+            rec["e_code"] = parse_disease_code(sheet.cell(r, dmk_col).value)
+            rec["dmk_raw"] = sheet.cell(r, dmk_col).value
+        if cnt_col:
+            rec["cnt"] = sheet.cell(r, cnt_col).value
+        if ascvd_col:
+            ascvd_val = sheet.cell(r, ascvd_col).value
+            if ascvd_val is not None and str(ascvd_val).strip() != "":
+                rec["ascvd"] = ascvd_val
+        if phone_cols:
+            contact = pick_contact_from_values([sheet.cell(r, c).value for c in phone_cols])
+            rec["phone"] = contact.phone
+            rec["mobile"] = contact.mobile
+        if addr_col:
+            rec["address"] = normalize_text(sheet.cell(r, addr_col).value) or None
+        if clinic_val:
+            rec["clinic"] = clinic_val
+
+        if any(rec.get(k) for k in ("name", "bday", "phone", "mobile", "address", "ascvd", "e_code", "cnt")):
+            out.append(rec)
+    return out
 
 
 def collect_all_members(
@@ -3513,6 +3947,46 @@ def collect_all_members(
         if pid not in members:
             members[pid] = _empty_member()
         return members[pid]
+
+    synthetic_counter = 0
+
+    def _register_member_keys(pid: str, rec: Dict[str, Any]) -> None:
+        for kind, key in _iter_member_union_keys(rec):
+            if kind == "name_bday":
+                name_bday_map.setdefault(key, set()).add(pid)
+            elif kind == "name_phone":
+                name_phone_map.setdefault(key, set()).add(pid)
+            elif kind == "name_only":
+                name_only_map.setdefault(key, set()).add(pid)
+
+    def _merge_or_create_noid_member(rec: Dict[str, Any]) -> None:
+        nonlocal synthetic_counter
+        matched_ids: Optional[set[str]] = None
+        for kind, key in _iter_member_union_keys(rec):
+            candidate = (
+                name_bday_map.get(key, set()) if kind == "name_bday"
+                else name_phone_map.get(key, set()) if kind == "name_phone"
+                else name_only_map.get(key, set())
+            )
+            if candidate:
+                matched_ids = candidate
+                break
+
+        if matched_ids and len(matched_ids) == 1:
+            pid = next(iter(matched_ids))
+            target = _get_or_create(pid)
+        else:
+            synthetic_counter += 1
+            pid = f"__NOID__{synthetic_counter:06d}"
+            target = _get_or_create(pid)
+
+        for key, value in rec.items():
+            _fill_member_field(target, key, value)
+        _register_member_keys(pid, target)
+
+    name_bday_map: Dict[str, set[str]] = {}
+    name_phone_map: Dict[str, set[str]] = {}
+    name_only_map: Dict[str, set[str]] = {}
 
     # ── 1. 月份分頁（最低優先）──────────────────────────────────
     month_sheets = sorted(
@@ -3565,7 +4039,7 @@ def collect_all_members(
         id_col_cand = find_column_exact(hmap, id_aliases)
         id_col = find_id_col_by_content(sh, header_row, id_col_cand)
         name_col = find_column_exact(hmap, ["會員姓名", "姓名"])
-        bday_col = find_column_exact(hmap, ["會員生日", "生日"])
+        bday_col = find_bday_column(hmap)
         phone_cols = [c for hdr, c in hmap.items() if c != id_col and is_phone_header(hdr)]
         addr_col = next((c for hdr, c in hmap.items() if c != id_col and is_address_header(hdr)), None)
         abc_col = find_column_exact(hmap, ["會員別"])
@@ -3575,6 +4049,17 @@ def collect_all_members(
         clinic_val = normalize_text(sh.cell(1, 1).value)
         if id_col:
             data_start_row = _first_valid_id_row(sh, id_col, header_row)
+            # 舊版 114 會員名單常沒有標準的 姓名/地址/電話 標題，
+            # 但資料固定落在第 6/7/8 欄：姓名 / 地址 / 電話。
+            if not name_col and sh.max_column >= 8 and data_start_row <= sh.max_row:
+                sample_name = normalize_text(sh.cell(data_start_row, 6).value)
+                sample_phone = normalize_phone_value(sh.cell(data_start_row, 8).value)
+                if sample_name and sample_phone:
+                    name_col = 6
+                    if addr_col is None:
+                        addr_col = 7
+                    if not phone_cols:
+                        phone_cols = [8]
             for r in range(data_start_row, sh.max_row + 1):
                 pid = normalize_id(sh.cell(r, id_col).value)
                 if not pid or not is_valid_tw_id(pid):
@@ -3601,6 +4086,14 @@ def collect_all_members(
                 _fill_member_field(rec, "mobile", contact.mobile)
                 _fill_member_field(rec, "address", address or None)
                 _fill_member_field(rec, "clinic", clinic_val)
+
+    for pid, rec in members.items():
+        _register_member_keys(pid, rec)
+
+    for sname in snames:
+        sh = wb_src[sname]
+        for rec in _extract_member_noid_rows(sh, id_aliases):
+            _merge_or_create_noid_member(rec)
 
     return members
 
@@ -3637,11 +4130,12 @@ def build_contact_map(sh_phone: Any) -> Dict[str, ContactInfo]:
         contact = pick_contact_from_values([sh_phone.cell(r, c).value for c in phone_cols])
         address = normalize_text(sh_phone.cell(r, addr_col).value) if addr_col else ""
         if contact.phone or contact.mobile or address:
-            result[pid] = ContactInfo(
+            incoming = ContactInfo(
                 phone=contact.phone,
                 mobile=contact.mobile,
                 address=address or None,
             )
+            result[pid] = merge_contact_info(result.get(pid), incoming)
     return result
 
 
@@ -3678,10 +4172,86 @@ def _log_duplicate_ids(sheet: Any, label: str) -> None:
 # ============================================================
 # P4P / 自選 / 114 / 115X 旗標
 # ============================================================
+def _p4p_status_priority(status: Any) -> int:
+    text = normalize_text(status)
+    if "本院收案" in text:
+        return 0
+    if "未收案" in text:
+        return 1
+    if "外院收案" in text or "外院收" in text:
+        return 2
+    return 3
+
+
+def _sort_p4p_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        records,
+        key=lambda rec: (
+            _p4p_status_priority(rec.get("status")),
+            normalize_text(rec.get("plan")),
+            normalize_text(rec.get("status")),
+        ),
+    )
+
+
+def _upsert_p4p_record(
+    records: List[Dict[str, Any]],
+    *,
+    plan: str = "",
+    status: str = "",
+    enroll_dt: Any = None,
+    last_track_dt: Any = None,
+    next_track_dt: Any = None,
+    overdue: str = "",
+) -> None:
+    if not any((plan, status, enroll_dt, last_track_dt, next_track_dt, overdue)):
+        return
+    match = None
+    if plan:
+        for rec in records:
+            if normalize_text(rec.get("plan")) == plan:
+                match = rec
+                break
+    if match is None:
+        match = {}
+        records.append(match)
+    if plan:
+        match["plan"] = plan
+    if status:
+        match["status"] = status
+    if enroll_dt is not None:
+        match["enroll_dt"] = enroll_dt
+    if last_track_dt is not None:
+        match["last_track_dt"] = last_track_dt
+    if next_track_dt is not None:
+        match["next_track_dt"] = next_track_dt
+    if overdue:
+        match["overdue"] = overdue
+
+
+def _finalize_p4p_member_record(member_p4p: Dict[str, Any]) -> Dict[str, Any]:
+    records = _sort_p4p_records(member_p4p.get("records", []))
+    member_p4p["records"] = records
+    primary = records[0] if records else {}
+    for key in ("plan", "status", "enroll_dt", "last_track_dt", "next_track_dt", "overdue"):
+        if primary.get(key) not in (None, ""):
+            member_p4p[key] = primary.get(key)
+    return member_p4p
+
+
+def format_p4p_record_display(record: Dict[str, Any]) -> str:
+    status = normalize_text(record.get("status"))
+    plan = normalize_text(record.get("plan"))
+    if status and plan:
+        return f"{status}({plan})"
+    return status or plan
+
+
 def build_p4p_map(sh_enroll: Any, sh_track: Any) -> Dict[str, Dict[str, Any]]:
     """
     合併 P4P收案 + P4P追蹤，回傳
-    {id: {plan, status, enroll_dt, last_track_dt, next_track_dt, overdue}}
+    {id: {plan, status, enroll_dt, last_track_dt, next_track_dt, overdue, records}}
+    records 保留同一病人的多筆 P4P 收案資料，並以本院收案優先排序。
     """
     result: Dict[str, Dict[str, Any]] = {}
     id_aliases = ["家醫收案會員ID", "ID", "身份證號", "身分證號"]
@@ -3697,15 +4267,10 @@ def build_p4p_map(sh_enroll: Any, sh_track: Any) -> Dict[str, Dict[str, Any]]:
                 pid = normalize_id(sh_enroll.cell(r, id_col).value)
                 if not pid or not is_valid_tw_id(pid):
                     continue
-                d = result.setdefault(pid, {})
-                if plan_col:
-                    plan = normalize_text(sh_enroll.cell(r, plan_col).value)
-                    if plan:
-                        d["plan"] = plan
-                if status_col:
-                    status = normalize_text(sh_enroll.cell(r, status_col).value)
-                    if status:
-                        d["status"] = status
+                d = result.setdefault(pid, {"records": []})
+                plan = normalize_text(sh_enroll.cell(r, plan_col).value) if plan_col else ""
+                status = normalize_text(sh_enroll.cell(r, status_col).value) if status_col else ""
+                _upsert_p4p_record(d["records"], plan=plan, status=status)
 
     # P4P追蹤：取收案計畫 / 日期欄 / 逾期狀態
     if sh_track is not None:
@@ -3722,26 +4287,25 @@ def build_p4p_map(sh_enroll: Any, sh_track: Any) -> Dict[str, Dict[str, Any]]:
                 pid = normalize_id(sh_track.cell(r, id_col).value)
                 if not pid or not is_valid_tw_id(pid):
                     continue
-                d = result.setdefault(pid, {})
-                if plan_col:
-                    plan = normalize_text(sh_track.cell(r, plan_col).value)
-                    if plan:
-                        d["plan"] = plan
-                if status_col:
-                    s = normalize_text(sh_track.cell(r, status_col).value)
-                    if s:
-                        d["status"] = s
-                if enroll_col:
-                    d["enroll_dt"]     = parse_date(sh_track.cell(r, enroll_col).value)
-                if last_col:
-                    d["last_track_dt"] = parse_date(sh_track.cell(r, last_col).value)
-                if next_col:
-                    d["next_track_dt"] = parse_date(sh_track.cell(r, next_col).value)
-                if overdue_col:
-                    overdue = normalize_text(sh_track.cell(r, overdue_col).value)
-                    if overdue:
-                        d["overdue"] = overdue
+                d = result.setdefault(pid, {"records": []})
+                plan = normalize_text(sh_track.cell(r, plan_col).value) if plan_col else ""
+                status = normalize_text(sh_track.cell(r, status_col).value) if status_col else ""
+                enroll_dt = parse_date(sh_track.cell(r, enroll_col).value) if enroll_col else None
+                last_track_dt = parse_date(sh_track.cell(r, last_col).value) if last_col else None
+                next_track_dt = parse_date(sh_track.cell(r, next_col).value) if next_col else None
+                overdue = normalize_text(sh_track.cell(r, overdue_col).value) if overdue_col else ""
+                _upsert_p4p_record(
+                    d["records"],
+                    plan=plan,
+                    status=status,
+                    enroll_dt=enroll_dt,
+                    last_track_dt=last_track_dt,
+                    next_track_dt=next_track_dt,
+                    overdue=overdue,
+                )
 
+    for member_p4p in result.values():
+        _finalize_p4p_member_record(member_p4p)
     return result
 
 
@@ -3762,6 +4326,177 @@ def build_id_set(sheet: Any, id_aliases: List[str]) -> set:
         pid = normalize_id(sheet.cell(r, id_col).value)
         if pid and is_valid_tw_id(pid):
             result.add(pid)
+    return result
+
+
+def _find_sheet_id_col(sheet: Any, id_aliases: List[str], search_rows: int = 10) -> Tuple[Optional[int], int]:
+    if sheet is None:
+        return None, 1
+    header_row = _find_header_row_contains_any(sheet, [id_aliases], search_rows=search_rows)
+    if header_row is None:
+        header_row = 1
+    hmap = build_header_map(sheet, header_row)
+    id_col = find_id_col_by_content(sheet, header_row, find_column_exact(hmap, id_aliases))
+    return id_col, header_row
+
+
+def _normalize_match_name(value: Any) -> str:
+    return clean_spaces(value).upper()
+
+
+def _bday_match_token(value: Any) -> Optional[str]:
+    dt = parse_date(value)
+    if not dt:
+        return None
+    return dt.strftime("%Y-%m-%d")
+
+
+def _phone_match_tokens(phone: Optional[str]) -> List[str]:
+    if not phone:
+        return []
+    if len(phone) >= 7:
+        return [phone[-7:]]
+    return []
+
+
+def _compose_match_keys(name: Any, bday: Any, phones: List[Any]) -> set[str]:
+    # 來源端規則：
+    # 1. 有生日 -> 只用 姓名+生日
+    # 2. 沒生日但有電話 -> 用 姓名+電話末7碼
+    # 3. 都沒有 -> 才退回只用姓名
+    normalized_name = _normalize_match_name(name)
+    if not normalized_name:
+        return set()
+
+    bday_token = _bday_match_token(bday)
+    if bday_token:
+        return {f"{normalized_name}|BDAY|{bday_token}"}
+
+    keys: set[str] = set()
+    found_phone = False
+    for raw in phones:
+        phone = normalize_phone_value(raw)
+        if phone:
+            found_phone = True
+        for token in _phone_match_tokens(phone):
+            keys.add(f"{normalized_name}|PHONE|{token}")
+    if not found_phone:
+        keys.add(normalized_name)
+    return keys
+
+
+def _iter_source_match_rows(sheet: Any, id_aliases: List[str]) -> List[Tuple[Any, Any, List[Any]]]:
+    if sheet is None:
+        return []
+
+    id_col, header_row = _find_sheet_id_col(sheet, id_aliases, search_rows=10)
+    if id_col is not None:
+        return []
+
+    hmap = build_header_map(sheet, header_row)
+    name_col = find_column_exact(hmap, ["姓名", "會員姓名", "名字"])
+    if not name_col:
+        return []
+
+    bday_col = find_bday_column(hmap)
+    phone_cols = [c for hdr, c in hmap.items() if c != name_col and is_phone_header(hdr)]
+    result: List[Tuple[Any, Any, List[Any]]] = []
+    for r in range(header_row + 1, sheet.max_row + 1):
+        result.append(
+            (
+                sheet.cell(r, name_col).value,
+                sheet.cell(r, bday_col).value if bday_col else None,
+                [sheet.cell(r, c).value for c in phone_cols],
+            )
+        )
+    return result
+
+
+def _build_member_match_maps(all_members: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, set[str]], Dict[str, set[str]], Dict[str, set[str]]]:
+    name_bday_map: Dict[str, set[str]] = {}
+    name_phone_map: Dict[str, set[str]] = {}
+    name_only_map: Dict[str, set[str]] = {}
+    for pid, rec in all_members.items():
+        for kind, key in _iter_member_union_keys(rec):
+            if kind == "name_bday":
+                name_bday_map.setdefault(key, set()).add(pid)
+            elif kind == "name_phone":
+                name_phone_map.setdefault(key, set()).add(pid)
+            elif kind == "name_only":
+                name_only_map.setdefault(key, set()).add(pid)
+    return name_bday_map, name_phone_map, name_only_map
+
+
+def _match_source_row_to_member_ids(
+    name: Any,
+    bday: Any,
+    phones: List[Any],
+    name_bday_map: Dict[str, set[str]],
+    name_phone_map: Dict[str, set[str]],
+    name_only_map: Dict[str, set[str]],
+) -> Optional[set[str]]:
+    matched_ids: Optional[set[str]] = None
+    for key in _compose_match_keys(name, bday, phones):
+        if "|BDAY|" in key:
+            candidate = name_bday_map.get(key, set())
+        elif "|PHONE|" in key:
+            candidate = name_phone_map.get(key, set())
+        else:
+            candidate = name_only_map.get(key, set())
+        if candidate:
+            matched_ids = candidate
+            break
+
+    if (not matched_ids or len(matched_ids) != 1) and name:
+        name_key = _normalize_match_name(name)
+        if name_key:
+            candidate = name_only_map.get(name_key, set())
+            if len(candidate) == 1:
+                matched_ids = candidate
+    return matched_ids
+
+
+def build_member_key_set_from_source(
+    all_members: Dict[str, Dict[str, Any]],
+    sheet: Any,
+    id_aliases: List[str],
+) -> set[str]:
+    if sheet is None:
+        return set()
+
+    result: set[str] = set()
+    direct_ids = build_id_set(sheet, id_aliases)
+    for pid in direct_ids:
+        if pid in all_members:
+            result.add(pid)
+
+    match_rows = _iter_source_match_rows(sheet, id_aliases)
+    if not match_rows:
+        return result
+
+    name_bday_map, name_phone_map, name_only_map = _build_member_match_maps(all_members)
+    for row_name, row_bday, row_phones in match_rows:
+        matched_ids = _match_source_row_to_member_ids(
+            row_name,
+            row_bday,
+            row_phones,
+            name_bday_map,
+            name_phone_map,
+            name_only_map,
+        )
+        if matched_ids and len(matched_ids) == 1:
+            result.add(next(iter(matched_ids)))
+    return result
+
+
+def build_member_key_set_from_sources(
+    all_members: Dict[str, Dict[str, Any]],
+    sheets: List[Any],
+    id_aliases: List[str],
+) -> set[str]:
+    result: set[str] = set()
+    for sheet in sheets:
+        result.update(build_member_key_set_from_source(all_members, sheet, id_aliases))
     return result
 
 
@@ -3882,14 +4617,12 @@ def _recompute_member_category(
 # ============================================================
 # 資料填充子函數
 # ============================================================
-def _load_and_validate_source(source_path: str):
-    ext = os.path.splitext(source_path)[1].lower()
-    if ext == ".csv":
-        wb = _load_csv_as_workbook(source_path)
-    elif ext == ".ods":
-        wb = _load_ods_as_workbook(source_path)
-    else:
-        wb = _load_xlsx_as_workbook(source_path)
+def _load_and_validate_source(
+    source_path: str,
+    profile: Optional[ProcessingProfile] = None,
+):
+    profile = _resolve_profile(profile)
+    wb = profile.load_source_workbook(source_path)
     need = {
         "HealthCase": ("HealthCase", "健康管理列表", "個案健康管理列表"),
         "成人健檢": ("成人健檢", "成人預防保健"),
@@ -3911,7 +4644,7 @@ def _is_excel_source_file(filename: str) -> bool:
         return False
     if re.match(r"^選會員\d{4}_\d{4}\.xlsx$", base):
         return False
-    return ext in (".xlsx", ".xlsm", ".xltx", ".xltm", ".csv", ".ods")
+    return ext in (".xlsx", ".xls", ".xlsm", ".xltx", ".xltm", ".csv", ".ods")
 
 
 def _iter_source_files(folder_path: str) -> List[str]:
@@ -3922,7 +4655,13 @@ def _iter_source_files(folder_path: str) -> List[str]:
             full = os.path.join(root, name)
             if os.path.isfile(full) and _is_excel_source_file(name):
                 files.append(full)
-    return files
+    return sorted(
+        files,
+        key=lambda p: (
+            HIS_MONTHLY_FEE_FOLDER_NAME in str(Path(p).parts),
+            p,
+        ),
+    )
 
 
 def _append_sheet_rows(src_ws, dst_ws, skip_header: bool = False) -> None:
@@ -3931,57 +4670,126 @@ def _append_sheet_rows(src_ws, dst_ws, skip_header: bool = False) -> None:
         dst_ws.append(list(row))
 
 
+def detect_encoding(
+    csv_path: str,
+    encodings: Tuple[str, ...] = ("utf-16", "utf-16le", "utf-8-sig", "utf-8"),
+) -> str:
+    """
+    優先判斷 Unicode 類 CSV。
+    若無法判斷，呼叫端再退回 HIS 常見的 cp950 相容模式。
+    """
+    with open(csv_path, "rb") as f:
+        raw = f.read(4)
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return "utf-16"
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+
+    last_error: Optional[Exception] = None
+    for encoding in encodings:
+        try:
+            with open(csv_path, "r", encoding=encoding, newline="") as f:
+                for _ in f:
+                    pass
+            return encoding
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    raise RuntimeError(f"無法判斷 {os.path.basename(csv_path)} 的編碼: {last_error}") from last_error
+
+
 def _load_csv_as_workbook(csv_path: str):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = os.path.splitext(os.path.basename(csv_path))[0][:31] or "Sheet1"
 
-    encodings = ("utf-8-sig", "utf-8", "cp950", "big5")
-    last_error: Optional[Exception] = None
-    for enc in encodings:
+    try:
         try:
-            with open(csv_path, "r", encoding=enc, newline="") as f:
-                for row in csv.reader(f):
-                    ws.append(row)
-            return wb
-        except UnicodeDecodeError as e:
-            last_error = e
-            if ws.max_row > 1 or ws.max_column > 1 or ws["A1"].value is not None:
-                ws.delete_rows(1, ws.max_row)
-            continue
+            enc = detect_encoding(csv_path)
+            errors = "strict"
+        except RuntimeError:
+            # HIS 匯出的傳統中文 CSV 常混有少數不標準位元組，
+            # 退回 cp950 相容模式可最大化保留內容。
+            enc = "cp950"
+            errors = "replace"
 
-    raise ValueError(f"CSV 檔案無法以支援編碼讀取：{os.path.basename(csv_path)}") from last_error
+        with open(csv_path, "r", encoding=enc, errors=errors, newline="") as f:
+            for row in csv.reader(f):
+                ws.append(row)
+        return wb
+    except Exception as e:
+        raise ValueError(f"CSV 檔案無法以支援編碼讀取：{os.path.basename(csv_path)}") from e
 
 
 def _load_ods_as_workbook(ods_path: str):
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
+    office_ns = "urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    table_ns = "urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    text_ns = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+    q_spreadsheet = f"{{{office_ns}}}spreadsheet"
+    q_table = f"{{{table_ns}}}table"
+    q_row = f"{{{table_ns}}}table-row"
+    q_cell = f"{{{table_ns}}}table-cell"
+    q_covered_cell = f"{{{table_ns}}}covered-table-cell"
+    q_name = f"{{{table_ns}}}name"
+    q_col_repeat = f"{{{table_ns}}}number-columns-repeated"
+    q_row_repeat = f"{{{table_ns}}}number-rows-repeated"
+    q_paragraph = f"{{{text_ns}}}p"
 
-    doc = load_ods_document(ods_path)
-    tables = doc.spreadsheet.getElementsByType(Table)
-    if not tables:
+    with zipfile.ZipFile(ods_path, "r") as zf:
+        root = ET.fromstring(zf.read("content.xml"))
+
+    spreadsheet = root.find(f".//{q_spreadsheet}")
+    if spreadsheet is None:
         ws = wb.create_sheet(title="Sheet1")
         return wb
 
-    for idx, table in enumerate(tables, start=1):
-        title = str(table.getAttribute("name") or f"Sheet{idx}")
+    table_count = 0
+    for idx, table in enumerate(spreadsheet, start=1):
+        if table.tag != q_table:
+            continue
+        table_count += 1
+        title = str(table.attrib.get(q_name) or f"Sheet{idx}")
         ws = wb.create_sheet(title=title[:31] or f"Sheet{idx}")
-        for row in table.getElementsByType(TableRow):
+        for row in table:
+            if row.tag != q_row:
+                continue
+
             values: List[str] = []
-            for cell in row.getElementsByType(TableCell):
-                repeat = int(cell.getAttribute("numbercolumnsrepeated") or 1)
-                text_parts = []
-                for p in cell.getElementsByType(P):
-                    parts: List[str] = []
-                    for child in getattr(p, "childNodes", []) or []:
-                        data = getattr(child, "data", None)
-                        if data is not None:
-                            parts.append(str(data))
-                    if parts:
-                        text_parts.append("".join(parts))
+            pending_blank_repeat = 0
+            for cell in row:
+                if cell.tag not in (q_cell, q_covered_cell):
+                    continue
+                repeat = int(cell.attrib.get(q_col_repeat, "1") or "1")
+                text_parts = [
+                    "".join(paragraph.itertext()).strip()
+                    for paragraph in cell.iter(q_paragraph)
+                ]
+                text_parts = [part for part in text_parts if part]
                 text = "\n".join(text_parts)
-                values.extend([text] * repeat)
+                if text:
+                    if pending_blank_repeat:
+                        values.extend([""] * pending_blank_repeat)
+                        pending_blank_repeat = 0
+                    values.extend([text] * repeat)
+                else:
+                    pending_blank_repeat += repeat
+
+            if not values:
+                continue
+
+            row_repeat = int(row.attrib.get(q_row_repeat, "1") or "1")
             ws.append(values)
+            if row_repeat > 1:
+                values_copy = list(values)
+                for _ in range(row_repeat - 1):
+                    ws.append(values_copy)
+
+        if table_count == 0:
+            ws = wb.create_sheet(title="Sheet1")
+
+    if table_count == 0:
+        ws = wb.create_sheet(title="Sheet1")
     return wb
 
 
@@ -4028,6 +4836,20 @@ def _load_xlsx_as_workbook(xlsx_path: str):
                 pass
 
 
+def _load_xls_as_workbook(xls_path: str):
+    book = xlrd.open_workbook(xls_path)
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    for idx, sheet in enumerate(book.sheets(), start=1):
+        title = str(sheet.name or f"Sheet{idx}")
+        ws = wb.create_sheet(title=title[:31] or f"Sheet{idx}")
+        for row_idx in range(sheet.nrows):
+            values = [sheet.cell_value(row_idx, col_idx) for col_idx in range(sheet.ncols)]
+            ws.append(values)
+    return wb
+
+
 def _normalize_sheet_lookup(text: Any) -> str:
     s = normalize_text(text)
     if not s:
@@ -4044,6 +4866,7 @@ def _is_generic_sheet_title(title: str) -> bool:
 
 _SOURCE_SHEET_ALIASES: Dict[str, Tuple[str, ...]] = {
     "會員名單": ("會員名單", "較需要照護名單", "家醫計畫較需要照護名單"),
+    "114會員名單補充": ("114會員名單補充",),
     "ascvd": ("ascvd",),
     "HealthCase": ("healthcase", "健康管理列表", "個案健康管理列表"),
     "成人健檢": ("成人健檢", "成人預防保健"),
@@ -4062,13 +4885,22 @@ _SOURCE_SHEET_ALIASES: Dict[str, Tuple[str, ...]] = {
 
 def _classify_r13210_file(file_path: str) -> Optional[str]:
     norm_file = _normalize_sheet_lookup(os.path.splitext(os.path.basename(file_path))[0])
-    if any(token in norm_file for token in ("不選", "不要", "115x")):
+    has_member_gate = ("會員" in norm_file) or ("選" in norm_file)
+    has_self_select_token = any(token in norm_file for token in ("自選", "預選"))
+    has_115_token = "115" in norm_file and "1150" not in norm_file and "1151" not in norm_file
+
+    # 檔名分類規則：
+    # 0. 先決條件：檔名需包含「會員」或「選」
+    # 1. 檔名包含 [115x / 115X / 不選] 視為不選會員
+    # 2. 其餘包含 [115 / 自選 / 預選] 視為自選會員
+    #    但 1150 / 1151（例如 11501 月報）不視為自選判斷依據
+    if not has_member_gate:
+        return None
+
+    if "115x" in norm_file or "不選" in norm_file or "不要" in norm_file:
         return "115X"
 
-    if any(token in norm_file for token in ("預選", "自選")):
-        return "自選名單"
-
-    if "115x" not in norm_file and "115" in norm_file:
+    if has_115_token or has_self_select_token:
         return "自選名單"
 
     if "r13210" not in norm_file:
@@ -4076,7 +4908,7 @@ def _classify_r13210_file(file_path: str) -> Optional[str]:
 
     raise ValueError(
         f"檔名無法判定為預選或不選：{os.path.basename(file_path)}\n"
-        "請更新檔名內容包含「115」或「115X」後，再重新進行處理。"
+        "請更新檔名內容明確符合 115X 或 115 自選規則後，再重新進行處理。"
     )
 
 
@@ -4109,18 +4941,64 @@ def _looks_like_member_roster_sheet(src_ws: Any) -> bool:
     return header_row is not None
 
 
+def _looks_like_member_roster_with_ascvd_sheet(src_ws: Any) -> bool:
+    id_aliases = ["ID", "身份證號", "身份證號碼", "身分證號", "身分證號碼"]
+    header_row = _find_header_row_contains_any(
+        src_ws,
+        [id_aliases, ["疾病樣態"], ["ASCVD", "ascvd"]],
+        search_rows=10,
+    )
+    return header_row is not None
+
+
 def _canonical_source_sheet_name(sheet_name: str, file_path: str, single_sheet: bool, src_ws: Any = None) -> str:
     norm_sheet = _normalize_sheet_lookup(sheet_name)
     norm_file = _normalize_sheet_lookup(os.path.splitext(os.path.basename(file_path))[0])
+    base_name = os.path.basename(file_path)
+
+    file_stem = os.path.splitext(os.path.basename(file_path))[0]
+    if re.fullmatch(r"1(14|15)\d{2}", file_stem):
+        return file_stem
 
     if re.fullmatch(r"1(14|15)\d{2}", str(sheet_name)):
         return str(sheet_name)
 
-    if "需照護名單" in os.path.basename(file_path):
+    if src_ws is not None and _looks_like_member_roster_with_ascvd_sheet(src_ws):
+        return "ascvd"
+
+    if "需照護名單" in os.path.basename(file_path) or "需要照護名單" in os.path.basename(file_path):
+        if src_ws is not None and _looks_like_member_roster_with_ascvd_sheet(src_ws):
+            return "ascvd"
+        if src_ws is not None and _looks_like_member_roster_sheet(src_ws):
+            return "會員名單"
         return "會員名單"
 
+    if (
+        "a115" in norm_file
+        and "115x" not in norm_file
+        and any(token in norm_file for token in ("預選會員", "自選會員", "自選名單", "預選"))
+        and (single_sheet or _is_generic_sheet_title(sheet_name))
+    ):
+        return "自選名單115"
+
+    if (
+        "114" in norm_file
+        and "會員" in norm_file
+        and "115" not in norm_file
+        and not any(token in norm_file for token in ("自選", "預選", "115x", "a115"))
+        and (single_sheet or _is_generic_sheet_title(sheet_name))
+    ):
+        return "114會員名單補充"
+
     r13210_kind = _classify_r13210_file(file_path)
-    if "基本資料檔列印" in sheet_name and r13210_kind:
+    if r13210_kind and (
+        single_sheet
+        or _is_generic_sheet_title(sheet_name)
+        or "基本資料檔列印" in sheet_name
+        or "特記分析報表" in sheet_name
+    ):
+        if r13210_kind == "自選名單" and ("a115" in norm_file or "預選會員" in base_name):
+            return "自選名單115"
         return r13210_kind
 
     if any(token in norm_file for token in ("自選會員", "自選名單", "預選")):
@@ -4166,12 +5044,16 @@ def _format_mapped_pairs(mapped_pairs: List[str], limit: int = 20) -> str:
     return "\n".join(lines)
 
 
-def _merge_source_folder(folder_path: str):
+def _merge_source_folder(
+    folder_path: str,
+    profile: Optional[ProcessingProfile] = None,
+):
     """
     將資料夾內所有 Excel 合併成一個暫時 workbook：
     - 同名 sheet：保留第一個檔案的表頭，後續檔案從第 2 列開始 append
     - 不同 sheet：直接新增
     """
+    profile = _resolve_profile(profile)
     files = _iter_source_files(folder_path)
     if not files:
         raise ValueError("所選資料夾內找不到可用的 Excel 檔案（支援 .xlsx/.xlsm）")
@@ -4189,13 +5071,7 @@ def _merge_source_folder(folder_path: str):
         if _classify_r13210_file(path) is not None:
             found_r13210 = True
         try:
-            ext = os.path.splitext(path)[1].lower()
-            if ext == ".csv":
-                wb = _load_csv_as_workbook(path)
-            elif ext == ".ods":
-                wb = _load_ods_as_workbook(path)
-            else:
-                wb = _load_xlsx_as_workbook(path)
+            wb = profile.load_source_workbook(path)
         except Exception:
             skipped_files.append(base)
             continue
@@ -4204,7 +5080,7 @@ def _merge_source_folder(folder_path: str):
         single_sheet = len(wb.sheetnames) == 1
         for sname in wb.sheetnames:
             src_ws = wb[sname]
-            dst_name = _canonical_source_sheet_name(sname, path, single_sheet, src_ws)
+            dst_name = profile.canonical_source_sheet_name(sname, path, single_sheet, src_ws)
             if dst_name != sname:
                 mapped_pairs.append(f"{base}:{sname}->{dst_name}")
             if dst_name not in created:
@@ -4283,15 +5159,16 @@ def _fill_member_basic(
             mobile=info.get("mobile"),
             address=info.get("address"),
         )
-        contact = merge_contact_info(contact_map.get(pid), base_contact)
+        contact = merge_contact_info(base_contact, contact_map.get(pid))
         cnt    = info.get("cnt")
         clinic = info.get("clinic") or clinic_val
         age    = calc_age(bday, now) if isinstance(bday, datetime.date) else -1
         sex    = infer_gender_from_id(pid)
+        output_pid = pid if is_valid_tw_id(pid) else None
 
         safe_set(ws, out_r, _c_clinic,  clinic)
         safe_set(ws, out_r, _c_name,    name or None)
-        safe_set(ws, out_r, _c_id,      pid)
+        safe_set(ws, out_r, _c_id,      output_pid)
         safe_set(ws, out_r, _c_bday,    bday)
         safe_set(ws, out_r, _c_age,     age if age >= 0 else None)
         safe_set(ws, out_r, _c_tel,     contact.phone or None)
@@ -4305,6 +5182,7 @@ def _fill_member_basic(
 
         meta[out_r] = MemberMeta(
             row=out_r,
+            pid=pid,
             bday=bday,
             age=age,
             e_code=e_code,
@@ -4481,6 +5359,7 @@ def _compute_all_derived(
     now:        datetime.date,
     claim_sums: Optional[Dict[str, Dict[str, float]]] = None,
     kpi_marks:  Optional[Dict[str, set]] = None,
+    screening_member_ids: Optional[Dict[str, set[str]]] = None,
 ) -> None:
     kpi_marks = kpi_marks or {}
 
@@ -4597,6 +5476,12 @@ def _compute_all_derived(
         visit_count_115 = ws.cell(rr, _c_n115).value if _c_n115 else None
         claim_amount_114 = ws.cell(rr, _c_r114).value if _c_r114 else None
         claim_amount_115 = ws.cell(rr, _c_s115).value if _c_s115 else None
+        pid = normalize_id(ws.cell(rr, _c_id).value)
+        adult_in_list = bool(pid and screening_member_ids and pid in screening_member_ids.get("adult", set()))
+        pap_in_list = bool(pid and screening_member_ids and pid in screening_member_ids.get("pap", set()))
+        flu_in_list = bool(pid and screening_member_ids and pid in screening_member_ids.get("flu", set()))
+        fit_in_list = bool(pid and screening_member_ids and pid in screening_member_ids.get("fit", set()))
+        hep_in_list = bool(pid and screening_member_ids and pid in screening_member_ids.get("hep", set()))
         fee_score_amount_114 = claim_amount_114
         fee_score_amount_115 = claim_amount_115
         if claim_sums is not None:
@@ -4606,16 +5491,20 @@ def _compute_all_derived(
                 v114a_total = data.get("114_amt_total", 0.0)
                 v115a = data.get("115_amt", 0.0)
                 v115_months = max(int(data.get("115_months", 0.0)), 1)
-                fee_score_amount_114 = (v114a_total / 12.0) if v114a_total != 0 else None
-                fee_score_amount_115 = (v115a / float(v115_months)) if v115a != 0 else None
+                fee_score_amount_114 = _to_excel_int(v114a_total / 12.0) if v114a_total != 0 else None
+                fee_score_amount_115 = _to_excel_int(v115a / float(v115_months)) if v115a != 0 else None
 
         score, breakdown = calc_score(
             e_code=e_code, ascvd_raw=ascvd_raw,
             hba_val=hba_val, hba_dt=hba_dt,
             ldl_val=ldl_val, ldl_dt=ldl_dt,
-            adult_dt=adult_dt, pap_dt=pap_dt,
-            flu_dt=flu_dt, fit_dt=fit_dt, hep_dt=hep_dt,
+            adult_dt=adult_dt, adult_in_list=adult_in_list,
+            pap_dt=pap_dt, pap_in_list=pap_in_list,
+            flu_dt=flu_dt, flu_in_list=flu_in_list,
+            fit_dt=fit_dt, fit_in_list=fit_in_list,
+            hep_dt=hep_dt, hep_in_list=hep_in_list,
             age=age, sex=sex,
+            today=now,
             claim_amount_114=fee_score_amount_114,
             claim_amount_115=fee_score_amount_115,
             visit_count_114=visit_count_114,
@@ -4733,6 +5622,8 @@ def prepare_template_layout(ws) -> None:
         _ensure_aux_header(ws, ["是否為自選會員"], "BA", row1_value="是否為自選會員"),
         _ensure_aux_header(ws, ["是否為115X"], "BB", row1_value="是否為115X"),
         _ensure_aux_header(ws, ["115年1-4月就診次數"], "BC", row1_value="115年1-4月就診次數"),
+        _ensure_aux_header(ws, ["114年月平均"], "BD", row1_value="114年月平均"),
+        _ensure_aux_header(ws, ["115年月平均"], "BE", row1_value="115年月平均"),
         _ensure_aux_header(ws, ["地址"], "BF", row1_value="地址"),
         _ensure_aux_header(ws, ["114年1-4月就診次數"], "BG", row1_value="114年1-4月就診次數"),
     }
@@ -4746,15 +5637,19 @@ def prepare_template_layout(ws) -> None:
 # ============================================================
 # 結構化流程（V10.3）
 # ============================================================
-def load_source(source_path: str) -> SourceContext:
+def load_source(
+    source_path: str,
+    profile: Optional[ProcessingProfile] = None,
+) -> SourceContext:
+    profile = _resolve_profile(profile)
     if os.path.isdir(source_path):
         _log(f"掃描資料夾：{os.path.basename(os.path.abspath(source_path))}")
-        wb_src = _merge_source_folder(source_path)
+        wb_src = _merge_source_folder(source_path, profile=profile)
     else:
-        wb_src = _load_and_validate_source(source_path)
-    scan_cache = _scan_source_sheets(wb_src)
+        wb_src = _load_and_validate_source(source_path, profile=profile)
+    scan_cache = _scan_source_sheets(wb_src, profile=profile)
     all_members = collect_all_members(wb_src, partial_maps=scan_cache.partial_maps)
-    claim_sums, claim_months_115 = collect_monthly_claim_summaries(
+    claim_sums, claim_months_115 = profile.collect_monthly_claim_summaries(
         wb_src,
         monthly_scans=scan_cache.monthly_claim_sheets,
     )
@@ -4764,7 +5659,11 @@ def load_source(source_path: str) -> SourceContext:
         claim_sums,
         claim_months_115,
         hisb_scans=scan_cache.hisb_count_sheets,
+        profile=profile,
     )
+    sh_p4p_enroll = _first_sheet(wb_src, "P4P收案", "收案管理", "P4pCase")
+    sh_p4p_track = _first_sheet(wb_src, "P4P追蹤", "追蹤管理", "P4pTrack")
+    p4p_map = build_p4p_map(sh_p4p_enroll, sh_p4p_track)
     return SourceContext(
         wb_src=wb_src,
         sh_member=_first_sheet(wb_src, "會員名單", "較需要照護名單"),
@@ -4774,8 +5673,8 @@ def load_source(source_path: str) -> SourceContext:
         sh_phone=_first_sheet(wb_src, "行動電話", "基本資料檔列印"),
         sh_self_select=_first_sheet(wb_src, "自選會員", "自選名單"),
         sh_115x=_first_sheet(wb_src, "115X"),
-        sh_p4p_enroll=_first_sheet(wb_src, "P4P收案", "收案管理", "P4pCase"),
-        sh_p4p_track=_first_sheet(wb_src, "P4P追蹤", "追蹤管理", "P4pTrack"),
+        sh_p4p_enroll=sh_p4p_enroll,
+        sh_p4p_track=sh_p4p_track,
         screening_sheets={
             "adult": _require_sheet(wb_src, "成人健檢", "成人預防保健"),
             "pap":   _require_sheet(wb_src, "子宮抹片", "子宮頸抹片"),
@@ -4786,6 +5685,7 @@ def load_source(source_path: str) -> SourceContext:
         claim_sums=claim_sums,
         claim_months_115=claim_months_115,
         all_members=all_members,
+        p4p_map=p4p_map,
     )
 
 
@@ -4850,19 +5750,34 @@ def fill_external_data(source_ctx: SourceContext, template_ctx: TemplateContext,
     _log("套用 HealthCase 檢驗資料")
     _fill_health_case(ws, source_ctx.sh_health, cols, id_to_rows)
     _log("回填月份申報統計")
-    fill_monthly_claim_summary_columns(ws, data_start, last_row, cols, source_ctx.claim_sums)
+    fill_monthly_claim_summary_columns(
+        ws,
+        data_start,
+        last_row,
+        cols,
+        source_ctx.claim_sums,
+        meta=meta,
+    )
 
     _log("回填旗標與 P4P 狀態")
     _log_duplicate_ids(source_ctx.sh_p4p_enroll, "P4P收案")
     _log_duplicate_ids(source_ctx.sh_p4p_track, "P4P追蹤")
     id_aliases = ["身份證號", "身份證號碼", "身分證號", "身分證號碼", "ID", "家醫收案會員ID"]
-    member_ids = build_id_set(source_ctx.sh_member, id_aliases)
-    self_select_ids = build_id_set(source_ctx.sh_self_select, id_aliases)
-    x115_ids = build_id_set(source_ctx.sh_115x, id_aliases)
-    p4p_map = build_p4p_map(source_ctx.sh_p4p_enroll, source_ctx.sh_p4p_track)
+    member_sheets = [sheet for sheet in (
+        source_ctx.sh_member,
+        _first_sheet(source_ctx.wb_src, "114會員名單補充"),
+        source_ctx.sh_ascvd,
+    ) if sheet is not None]
+    member_ids = build_member_key_set_from_sources(source_ctx.all_members, member_sheets, id_aliases)
+    self_select_sheets = [sheet for sheet in (
+        source_ctx.sh_self_select,
+        _first_sheet(source_ctx.wb_src, "自選名單115"),
+    ) if sheet is not None]
+    self_select_ids = build_member_key_set_from_sources(source_ctx.all_members, self_select_sheets, id_aliases)
+    x115_ids = build_member_key_set_from_source(source_ctx.all_members, source_ctx.sh_115x, id_aliases)
     _fill_extra_flags(
         ws, cols, data_start, last_row, id_to_rows,
-        p4p_map, member_ids, self_select_ids, x115_ids,
+        source_ctx.p4p_map, member_ids, self_select_ids, x115_ids,
     )
     _recompute_member_category(ws, cols, id_to_rows, member_ids, self_select_ids, x115_ids)
 
@@ -4886,6 +5801,16 @@ def compute_derived(
         ldl_candidates=ldl_candidates,
     )
 
+    screening_member_ids: Dict[str, set[str]] = {}
+    if source_ctx is not None:
+        screening_id_aliases = ["ID", "身份證號", "身份證號碼", "身分證號", "身分證號碼"]
+        for key, sheet in source_ctx.screening_sheets.items():
+            screening_member_ids[key] = build_member_key_set_from_source(
+                source_ctx.all_members,
+                sheet,
+                screening_id_aliases,
+            )
+
     _compute_all_derived(
         ws,
         cols,
@@ -4895,6 +5820,7 @@ def compute_derived(
         now,
         claim_sums=source_ctx.claim_sums if source_ctx is not None else None,
         kpi_marks=kpi_marks,
+        screening_member_ids=screening_member_ids,
     )
     apply_date_format(ws, cols, data_start, last_row)
     apply_amount_format(ws, cols, data_start, last_row)
@@ -4941,8 +5867,26 @@ def compute_kpis(
         data_start,
         last_row,
     )
+    screening_member_ids: Dict[str, set[str]] = {}
+    if source_ctx is not None:
+        screening_id_aliases = ["ID", "身份證號", "身份證號碼", "身分證號", "身分證號碼"]
+        for key, sheet in source_ctx.screening_sheets.items():
+            screening_member_ids[key] = build_member_key_set_from_source(
+                source_ctx.all_members,
+                sheet,
+                screening_id_aliases,
+            )
     _log("產生醫生看工作表")
-    populate_doctor_sheet(template_ctx.wb_tpl, ws, cols, data_start, last_row, now)
+    populate_doctor_sheet(
+        template_ctx.wb_tpl,
+        ws,
+        cols,
+        data_start,
+        last_row,
+        now,
+        screening_member_ids=screening_member_ids,
+        p4p_map=source_ctx.p4p_map if source_ctx is not None else None,
+    )
     if source_ctx:
         _log("產生自選名單工作表")
         populate_self_select_sheet(
@@ -5146,14 +6090,19 @@ def _load_clinic_name_lookup(folder_path: str) -> Dict[str, str]:
     return {}
 
 
-def process_excel(source_path: str, template_path: str) -> str:
+def process_excel(
+    source_path: str,
+    template_path: str,
+    profile: Optional[ProcessingProfile] = None,
+) -> str:
+    profile = _resolve_profile(profile)
     now_dt = datetime.datetime.now(_TZ_TW)
     now = now_dt.date()
 
     _log("開始處理 Excel")
 
     _log(f"載入來源：{os.path.basename(os.path.abspath(source_path))}")
-    source_ctx = load_source(source_path)
+    source_ctx = load_source(source_path, profile=profile)
 
     _log(f"載入模板：{os.path.basename(template_path)}")
     template_ctx = load_template(template_path)
@@ -5207,14 +6156,10 @@ def main() -> None:
         return
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    template   = os.path.join(script_dir, Rules.TEMPLATE_NAME)
-
-    if not os.path.exists(template):
-        messagebox.showerror(
-            "錯誤",
-            f"找不到模板檔：\n{template}\n\n"
-            f"請把模板放到此 .py 同資料夾，檔名需為：\n{Rules.TEMPLATE_NAME}",
-        )
+    try:
+        template = _find_template(script_dir)
+    except RuntimeError as exc:
+        messagebox.showerror("錯誤", str(exc))
         return
 
     _log("已選擇來源資料夾，開始執行")
