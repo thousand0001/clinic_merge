@@ -22,6 +22,7 @@ import shutil
 import sys
 import tempfile
 from collections import defaultdict
+from copy import copy
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
@@ -707,9 +708,39 @@ def _is_subtotal_row(value: Any) -> bool:
     return text in {"小計", "合計", "總計"}
 
 
+def _monthly_member_key(name: Any, bday: Any, chart: Any, reader) -> Optional[Tuple[str, str]]:
+    display_name = GENERIC.normalize_text(name)
+    parsed_bday = reader.parse_roc_or_ad_date(bday)
+    if not display_name or not parsed_bday:
+        return None
+    return (reader.normalize_name(display_name), parsed_bday.isoformat())
+
+
+def _monthly_member_row_base(name: Any, bday: Any, chart: Any, reader) -> Optional[Dict[str, Any]]:
+    key = _monthly_member_key(name, bday, chart, reader)
+    if key is None:
+        return None
+    return {
+        "chart": reader.normalize_chart(chart),
+        "name": GENERIC.normalize_text(name),
+        "bday": reader.parse_roc_or_ad_date(bday),
+        "count": 0.0,
+        "amount": 0.0,
+        "date": None,
+    }
+
+
+def _keep_latest_date(current: Optional[dt.date], incoming: Any, fallback: str, reader) -> Optional[dt.date]:
+    parsed = reader.parse_roc_or_ad_date(incoming) or reader.parse_roc_or_ad_date(fallback)
+    if parsed is None:
+        return current
+    if current is None or parsed > current:
+        return parsed
+    return current
+
+
 def _collect_monthly_claim_rows(source_dir: Path, records, reader) -> Dict[str, list[list[Any]]]:
-    chart_to_pid, name_to_pid = _record_lookup_maps(records, reader)
-    monthly: Dict[str, Dict[str, Dict[str, float]]] = {}
+    monthly: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {}
 
     count_dir = source_dir / "次數"
     if count_dir.is_dir():
@@ -727,23 +758,27 @@ def _collect_monthly_claim_rows(source_dir: Path, records, reader) -> Dict[str, 
             header = rows[header_index]
             chart_col = reader.find_col(header, ["病歷號", "病歷號碼"])
             name_col = reader.find_col(header, ["姓名", "病患姓名"])
-            id_col = reader.find_col(header, ["身分證", "身分證號", "身份證號", "ID"])
+            bday_col = reader.find_col(header, ["生日", "出生日期", "出生年月日"])
             count_col = reader.find_col(header, ["看診次數", "次數", "就診次數"])
-            if None in (chart_col, name_col, id_col, count_col):
+            if None in (chart_col, name_col, bday_col, count_col):
                 continue
             for row in rows[header_index + 1:]:
-                if len(row) <= max(chart_col, name_col, id_col, count_col):
+                if len(row) <= max(chart_col, name_col, bday_col, count_col):
                     continue
-                pid = GENERIC.normalize_id(row[id_col])
-                if not pid:
-                    pid = _resolve_pid(row[chart_col], row[name_col], chart_to_pid, name_to_pid, reader)
-                if not pid:
+                if _is_subtotal_row(row[chart_col]) or _is_subtotal_row(row[name_col]):
                     continue
                 count = reader.parse_number(row[count_col])
                 if not count:
                     continue
-                data = monthly.setdefault(code, {}).setdefault(pid, {"count": 0.0, "amount": 0.0})
+                key = _monthly_member_key(row[name_col], row[bday_col], row[chart_col], reader)
+                if key is None:
+                    continue
+                data = monthly.setdefault(code, {}).setdefault(
+                    key,
+                    _monthly_member_row_base(row[name_col], row[bday_col], row[chart_col], reader),
+                )
                 data["count"] += count
+                data["date"] = _keep_latest_date(data.get("date"), None, _month_date(code), reader)
 
     fee_dir = source_dir / "費用"
     if fee_dir.is_dir():
@@ -758,27 +793,41 @@ def _collect_monthly_claim_rows(source_dir: Path, records, reader) -> Dict[str, 
             header = rows[header_index]
             chart_col = reader.find_col(header, ["病歷號", "病歷號碼"])
             name_col = reader.find_col(header, ["姓名", "病患姓名"])
+            bday_col = reader.find_col(header, ["生日", "出生日期", "出生年月日"])
+            date_col = reader.find_col(header, ["日期", "看診日期", "就診日期"])
             amount_col = reader.find_col(header, ["掛帳費", "費用小計", "總額", "申請金額"])
-            if None in (chart_col, name_col, amount_col):
+            if None in (chart_col, name_col, bday_col, amount_col):
                 continue
             for row in rows[header_index + 1:]:
-                if len(row) <= max(chart_col, name_col, amount_col):
+                if len(row) <= max(chart_col, name_col, bday_col, amount_col):
                     continue
                 if _is_subtotal_row(row[chart_col]) or _is_subtotal_row(row[name_col]):
-                    continue
-                pid = _resolve_pid(row[chart_col], row[name_col], chart_to_pid, name_to_pid, reader)
-                if not pid:
                     continue
                 amount = reader.parse_number(row[amount_col])
                 if not amount:
                     continue
-                data = monthly.setdefault(code, {}).setdefault(pid, {"count": 0.0, "amount": 0.0})
+                key = _monthly_member_key(row[name_col], row[bday_col], row[chart_col], reader)
+                if key is None:
+                    continue
+                data = monthly.setdefault(code, {}).setdefault(
+                    key,
+                    _monthly_member_row_base(row[name_col], row[bday_col], row[chart_col], reader),
+                )
                 data["amount"] += amount
+                visit_date = row[date_col] if date_col is not None and len(row) > date_col else None
+                data["date"] = _keep_latest_date(data.get("date"), visit_date, _month_date(code), reader)
 
     return {
         code: [
-            [pid, _month_date(code), _number_or_blank(values["count"]), _number_or_blank(values["amount"])]
-            for pid, values in sorted(member_map.items())
+            [
+                values["chart"],
+                values["name"],
+                values["bday"],
+                values.get("date") or _date_value(_month_date(code)),
+                _number_or_blank(values["count"]),
+                _number_or_blank(values["amount"]),
+            ]
+            for _key, values in sorted(member_map.items())
             if values["count"] or values["amount"]
         ]
         for code, member_map in sorted(monthly.items())
@@ -894,10 +943,163 @@ def _write_clean_source(source_dir: Path, clean_dir: Path) -> None:
     _save_workbook(
         clean_dir / "展望清洗_申報統計.xlsx",
         {
-            code: (["ID", "日期", "次數", "申請金額"], rows)
+            code: (["病歷號", "姓名", "生日", "日期", "次數", "申請金額"], rows)
             for code, rows in monthly_claim_rows.items()
         },
     )
+
+
+def _postprocess_key(name: Any, bday: Any) -> Optional[Tuple[str, str]]:
+    parsed = GENERIC.parse_date(bday)
+    text = GENERIC.normalize_text(name)
+    if not text or not parsed:
+        return None
+    return (normalize_name(text), parsed.isoformat())
+
+
+def _empty_month_bucket() -> Dict[str, Any]:
+    return {
+        "name": "",
+        "bday": None,
+        "last_visit": None,
+        "114_cnt": 0.0,
+        "114_cnt_q1": 0.0,
+        "115_cnt": 0.0,
+        "114_amt": 0.0,
+        "115_amt": 0.0,
+    }
+
+
+def _expected_month_buckets(source_dir: Path) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    reader = _select_reader(source_dir)
+    records = list(reader.collect_data(source_dir).values())
+    monthly_rows = _collect_monthly_claim_rows(source_dir, records, reader)
+    buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for code, rows in monthly_rows.items():
+        year = int(code[:3])
+        month = int(code[3:5])
+        for row in rows:
+            _chart, name, bday, visit_date, count, amount = row
+            key = _postprocess_key(name, bday)
+            if key is None:
+                continue
+            bucket = buckets.setdefault(key, _empty_month_bucket())
+            bucket["name"] = GENERIC.normalize_text(name)
+            bucket["bday"] = GENERIC.parse_date(bday)
+            parsed_visit = GENERIC.parse_date(visit_date)
+            if parsed_visit and (bucket["last_visit"] is None or parsed_visit > bucket["last_visit"]):
+                bucket["last_visit"] = parsed_visit
+            count_value = GENERIC.parse_float(count) or 0.0
+            amount_value = GENERIC.parse_float(amount) or 0.0
+            if year == 114:
+                bucket["114_cnt"] += count_value
+                bucket["114_amt"] += amount_value
+                if month <= 4:
+                    bucket["114_cnt_q1"] += count_value
+            elif year == 115:
+                bucket["115_cnt"] += count_value
+                bucket["115_amt"] += amount_value
+    return buckets
+
+
+def _copy_row_style(ws, src_row: int, dst_row: int) -> None:
+    for col in range(1, ws.max_column + 1):
+        src = ws.cell(src_row, col)
+        dst = ws.cell(dst_row, col)
+        if src.has_style:
+            dst._style = copy(src._style)
+        if src.number_format:
+            dst.number_format = src.number_format
+        if src.alignment:
+            dst.alignment = copy(src.alignment)
+        if src.border:
+            dst.border = copy(src.border)
+        if src.fill:
+            dst.fill = copy(src.fill)
+        if src.font:
+            dst.font = copy(src.font)
+    ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
+
+
+def _sheet_key_rows(ws, name_col: int, bday_col: int, data_start: int = 3) -> Dict[Tuple[str, str], int]:
+    result: Dict[Tuple[str, str], int] = {}
+    for row in range(data_start, ws.max_row + 1):
+        key = _postprocess_key(ws.cell(row, name_col).value, ws.cell(row, bday_col).value)
+        if key and key not in result:
+            result[key] = row
+    return result
+
+
+def _num_or_blank(value: float) -> Any:
+    if not value:
+        return None
+    return int(round(value)) if abs(value - round(value)) < 1e-9 else value
+
+
+def _write_member_month_values(ws, row: int, data: Dict[str, Any]) -> None:
+    ws.cell(row, 1).value = data["name"]
+    ws.cell(row, 2).value = ws.cell(row, 2).value or "D"
+    ws.cell(row, 7).value = data["bday"]
+    ws.cell(row, 11).value = data["last_visit"]
+    ws.cell(row, 12).value = _num_or_blank(data["114_cnt"])
+    ws.cell(row, 13).value = _num_or_blank(data["114_amt"])
+    ws.cell(row, 14).value = _num_or_blank(data["115_cnt"])
+    ws.cell(row, 15).value = _num_or_blank(data["115_amt"])
+
+
+def _write_doctor_month_values(ws, row: int, data: Dict[str, Any], months_115: int) -> None:
+    ws.cell(row, 2).value = data["name"]
+    ws.cell(row, 3).value = data["bday"]
+    ws.cell(row, 10).value = data["last_visit"]
+    ws.cell(row, 11).value = _num_or_blank(data["114_cnt"])
+    ws.cell(row, 12).value = _num_or_blank(data["114_cnt_q1"])
+    ws.cell(row, 13).value = _num_or_blank(data["115_cnt"])
+    ws.cell(row, 14).value = int(round(data["114_amt"] / 12.0)) if data["114_amt"] else None
+    ws.cell(row, 15).value = int(round(data["115_amt"] / float(max(months_115, 1)))) if data["115_amt"] else None
+
+
+def _postprocess_output(output_path: Path, source_dir: Path) -> None:
+    expected = _expected_month_buckets(source_dir)
+    if not expected:
+        return
+
+    months_115 = len(
+        {
+            int(code[3:5])
+            for code in _collect_monthly_claim_rows(source_dir, list(collect_data(source_dir).values()), _select_reader(source_dir))
+            if code.startswith("115")
+        }
+    ) or 1
+
+    wb = openpyxl.load_workbook(output_path)
+    ws_member = wb["會員總表"]
+    doctor_name = next((name for name in wb.sheetnames if name.startswith("醫生看")), None)
+    if not doctor_name:
+        wb.save(output_path)
+        return
+    ws_doctor = wb[doctor_name]
+
+    member_rows = _sheet_key_rows(ws_member, 1, 7)
+    doctor_rows = _sheet_key_rows(ws_doctor, 2, 3)
+    member_template_row = ws_member.max_row
+    doctor_template_row = ws_doctor.max_row
+
+    for key, data in expected.items():
+        member_row = member_rows.get(key)
+        if member_row is None:
+            member_row = ws_member.max_row + 1
+            _copy_row_style(ws_member, member_template_row, member_row)
+            member_rows[key] = member_row
+        _write_member_month_values(ws_member, member_row, data)
+
+        doctor_row = doctor_rows.get(key)
+        if doctor_row is None:
+            doctor_row = ws_doctor.max_row + 1
+            _copy_row_style(ws_doctor, doctor_template_row, doctor_row)
+            doctor_rows[key] = doctor_row
+        _write_doctor_month_values(ws_doctor, doctor_row, data, months_115)
+
+    wb.save(output_path)
 
 
 def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
@@ -915,6 +1117,7 @@ def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
     try:
         _write_clean_source(source_dir, clean_dir)
         temp_output = Path(GENERIC.process_excel(str(clean_dir), template))
+        _postprocess_output(temp_output, source_dir)
         final_output = source_dir.parent / temp_output.name
         if final_output.exists():
             final_output.unlink()
