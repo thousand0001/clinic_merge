@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-展望雲端專用選會員產檔。
+品安安診所展望雲端專用選會員產檔。
 
 輸出比照「選會員模板」的會員總表，並額外加上：
 - 病歷號
 - 備註
 
-展望費用檔沒有身份證號碼，因此本程式會：
-1. 優先用「病歷號 -> ID」對費用歸戶
-2. 病歷號對不到時，用「姓名唯一對到 ID」補歸戶
-3. 還是沒有 ID 的資料仍輸出，身份證號碼填入 "-"
+品安安展望資料夾目前包含：
+1. A115自選會員.XLSX：自選會員基本資料
+2. 115X不要會員.XLSX：不要會員名單，讀取時排除
+3. R11440/*.XLSX：門診診療次數月報表，直接用身分證號歸戶並累計次數與總額
 """
 
 from __future__ import annotations
@@ -39,6 +39,9 @@ TARGET_SHEET = "會員總表"
 PERCENTILE_SHEET_NAME = "百分位名單"
 DOCTOR_SHEET_NAME = "醫生看(從會員指標內容Key過來)"
 SELF_SELECT_SHEET_NAME = "自選名單(從會員指標內容Key過來)"
+DOCTOR_FORMAT_REFERENCE = Path(
+    "/Users/thousand0001/CloudStation/醫療群/梓寧給的資料/run_merge跑資料/方鼎系統/芝妍皮膚專科診所選會員_0525_1900.xlsx"
+)
 SCREENING_COLUMNS = {
     "成人健檢": "成人健檢\n最後篩檢日",
     "子宮抹片": "子宮抹片最後篩檢日",
@@ -152,6 +155,11 @@ def parse_roc_or_ad_date(value: Any) -> Optional[dt.date]:
     text = str(value).strip()
     if not text or text == "-":
         return None
+    compact = re.sub(r"\D", "", text)
+    if re.fullmatch(r"\d{6,8}", compact):
+        parsed = parse_compact_roc_or_ad_date(compact)
+        if parsed:
+            return parsed
     text = text.split(" ")[0].replace("-", "/")
     match = re.fullmatch(r"(\d{2,4})/(\d{1,2})/(\d{1,2})", text)
     if not match:
@@ -165,15 +173,33 @@ def parse_roc_or_ad_date(value: Any) -> Optional[dt.date]:
         return None
 
 
-def parse_roc_yyyymmdd(value: Any) -> Optional[dt.date]:
+def parse_compact_roc_or_ad_date(value: Any) -> Optional[dt.date]:
     text = str(value or "").strip()
-    match = re.fullmatch(r"(1(?:14|15))(\d{2})(\d{2})", text)
-    if not match:
+    if not re.fullmatch(r"\d{6,8}", text):
         return None
+    if len(text) == 7:
+        year = int(text[:3]) + 1911
+        month = int(text[3:5])
+        day = int(text[5:7])
+    elif len(text) == 8:
+        year = int(text[:4])
+        month = int(text[4:6])
+        day = int(text[6:8])
+        if year < 1911:
+            year += 1911
+    else:
+        year = int(text[:2]) + 1911
+        month = int(text[2:4])
+        day = int(text[4:6])
     try:
-        return dt.date(int(match.group(1)) + 1911, int(match.group(2)), int(match.group(3)))
+        return dt.date(year, month, day)
     except ValueError:
         return None
+
+
+def parse_roc_yyyymmdd(value: Any) -> Optional[dt.date]:
+    text = str(value or "").strip()
+    return parse_compact_roc_or_ad_date(text)
 
 
 def format_date(value: Any) -> Any:
@@ -346,12 +372,16 @@ def scan_root_files(
     for path in sorted(source_dir.iterdir()):
         if not path.is_file() or path.name.startswith("~$") or path.suffix.lower() not in (".xlsx", ".ods"):
             continue
+        if is_excluded_source(path.stem):
+            continue
         source_is_self_select = is_self_select_source(path.stem)
         for sheet_name, rows in iter_workbook_rows(path):
+            if is_excluded_source(sheet_name):
+                continue
             sheet_is_self_select = source_is_self_select or is_self_select_source(sheet_name)
             if not rows:
                 continue
-            header_index = find_header(rows, [["姓名", "會員姓名", "病患姓名"], ["ID", "身分證", "身分證號", "身份證號", "家醫收案會員ID"]])
+            header_index = find_header(rows, [["姓名", "會員姓名", "病患姓名"], ["ID", "身分證", "身分證號", "身分證號碼", "身份證號", "身份證號碼", "家醫收案會員ID"]])
             if header_index is None:
                 continue
             header = rows[header_index]
@@ -427,6 +457,73 @@ def scan_root_files(
                         rec.screenings["糞便潛血"] = parse_roc_or_ad_date(last_dt) or "-"
                     elif "肝炎" in indicator or "B、C肝" in indicator or "BC肝" in indicator.upper():
                         rec.screenings["BC肝炎"] = parse_roc_or_ad_date(last_dt) or "-"
+
+
+def scan_r11440_files(
+    source_dir: Path,
+    records: Dict[str, MemberRecord],
+    name_to_ids: Dict[str, Set[str]],
+    chart_to_ids: Dict[str, Set[str]],
+) -> None:
+    report_dir = source_dir / "R11440"
+    if not report_dir.is_dir():
+        return
+    for path in sorted(report_dir.iterdir()):
+        if not path.is_file() or path.name.startswith("~$") or path.suffix.lower() != ".xlsx":
+            continue
+        for _sheet_name, rows in iter_workbook_rows(path):
+            if not rows:
+                continue
+            header_index = find_header(rows, [["掛號證", "掛號証"], ["日期"], ["姓名"], ["身分證號", "身份證號"], ["次數"], ["總額"]])
+            if header_index is None:
+                continue
+            header = rows[header_index]
+            chart_col = find_col(header, ["掛號證", "掛號証", "病歷號", "病歷號碼"])
+            date_col = find_col(header, ["日期", "看診日期"])
+            name_col = find_col(header, ["姓名", "病患姓名"])
+            id_col = find_col(header, ["身分證號", "身份證號", "身分證", "身份證", "ID"])
+            bday_col = find_col(header, ["生日", "出生日期", "出生年月日"])
+            count_col = find_col(header, ["次數", "看診次數", "就診次數"])
+            amount_col = find_col(header, ["總額", "申報總額", "實際申報總額"])
+            if None in (chart_col, date_col, name_col, id_col, count_col, amount_col):
+                continue
+            for row in rows[header_index + 1:]:
+                if len(row) <= max(chart_col, date_col, name_col, id_col, count_col, amount_col):
+                    continue
+                visit_date = parse_roc_yyyymmdd(row[date_col])
+                if visit_date is None:
+                    continue
+                rec = add_identity(
+                    records,
+                    name_to_ids,
+                    chart_to_ids,
+                    chart=row[chart_col],
+                    name=row[name_col],
+                    pid=row[id_col],
+                    bday=row[bday_col] if bday_col is not None and len(row) > bday_col else None,
+                    source=f"R11440/{path.name}",
+                )
+                if rec is None:
+                    continue
+                count = parse_number(row[count_col])
+                amount = parse_number(row[amount_col])
+                year_bucket = visit_date.year - 1911
+                month = visit_date.month
+                if year_bucket == 114:
+                    rec.count_114 += count
+                    rec.amount_114 += amount
+                    if month <= 4:
+                        rec.count_114_q1 += count
+                        rec.amount_114_q1 += amount
+                elif year_bucket == 115:
+                    rec.count_115 += count
+                    rec.amount_115 += amount
+                    if month <= 4:
+                        rec.count_115_q1 += count
+                        rec.amount_115_q1 += amount
+                if rec.last_visit is None or visit_date > rec.last_visit:
+                    rec.last_visit = visit_date
+                rec.notes.add("R11440月報表")
 
 
 def scan_count_files(
@@ -591,6 +688,7 @@ def collect_data(source_dir: Path) -> Dict[str, MemberRecord]:
     name_to_ids: Dict[str, Set[str]] = defaultdict(set)
     chart_to_ids: Dict[str, Set[str]] = defaultdict(set)
     scan_root_files(source_dir, records, name_to_ids, chart_to_ids)
+    scan_r11440_files(source_dir, records, name_to_ids, chart_to_ids)
     scan_count_files(source_dir, records, name_to_ids, chart_to_ids)
     scan_fee_files(source_dir, records, name_to_ids, chart_to_ids)
     merge_name_records(records, name_to_ids)
@@ -613,6 +711,11 @@ def is_self_select_source(text: Any) -> bool:
     return any(token in compact for token in ("自選名單", "自選會員", "115自選", "a115"))
 
 
+def is_excluded_source(text: Any) -> bool:
+    compact = re.sub(r"[\s\-_()（）\[\]{}]+", "", str(text or "").strip()).lower()
+    return bool(compact and ("115x" in compact or "不選" in compact or "不要" in compact))
+
+
 def style_like_previous_row(ws, source_row: int, target_row: int, max_col: int) -> None:
     for col in range(1, max_col + 1):
         src = ws.cell(source_row, col)
@@ -627,7 +730,14 @@ def style_like_previous_row(ws, source_row: int, target_row: int, max_col: int) 
         dst.protection = copy.copy(src.protection)
 
 
-def ensure_extra_columns(ws) -> Tuple[int, int]:
+def style_member_total_row(ws, target_row: int, max_col: int) -> None:
+    style_like_previous_row(ws, 2, target_row, max_col)
+    for col in range(1, max_col + 1):
+        ws.cell(target_row, col).fill = PatternFill(fill_type=None)
+    generic._apply_member_row_style(ws, target_row, max_col)
+
+
+def ensure_extra_columns(ws) -> Tuple[int, int, int]:
     headers = [ws.cell(1, col).value for col in range(1, ws.max_column + 1)]
     compact = {compact_header(value): index + 1 for index, value in enumerate(headers)}
     max_col = ws.max_column
@@ -646,13 +756,20 @@ def ensure_extra_columns(ws) -> Tuple[int, int]:
         ws.cell(1, note_col).value = "備註"
         ws.cell(2, note_col).value = ""
 
-    for col in (chart_col, note_col):
+    self_select_col = compact.get(compact_header("是否為自選會員"))
+    if self_select_col is None:
+        max_col += 1
+        self_select_col = max_col
+        ws.cell(1, self_select_col).value = "是否為自選會員"
+        ws.cell(2, self_select_col).value = ""
+
+    for col in (chart_col, note_col, self_select_col):
         src = ws.cell(1, ws.max_column if ws.max_column < col else col - 1)
         ws.cell(1, col).font = Font(bold=True)
         ws.cell(1, col).fill = PatternFill("solid", fgColor="D9EAF7")
         ws.cell(1, col).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         ws.column_dimensions[get_column_letter(col)].width = 28 if col == note_col else 18
-    return chart_col, note_col
+    return chart_col, note_col, self_select_col
 
 
 def find_output_col(ws, aliases: Sequence[str]) -> Optional[int]:
@@ -682,6 +799,187 @@ def screening_value(rec: MemberRecord, key: str) -> Any:
     if value in (None, "", "-"):
         return None
     return value
+
+
+def disease_code_output(value: Any) -> Any:
+    text = generic.normalize_text(value).upper()
+    if not text:
+        return value
+    if "DKD" in text or "糖尿病腎" in text:
+        return 3
+    if "CKD" in text or "腎臟病" in text:
+        return 2
+    if "DM" in text or "糖尿病" in text:
+        return 1
+    if "ASCVD" in text:
+        return 4
+    return value
+
+
+def load_doctor_reference_sheet():
+    if not DOCTOR_FORMAT_REFERENCE.exists():
+        return None
+    wb = openpyxl.load_workbook(DOCTOR_FORMAT_REFERENCE)
+    for name in wb.sheetnames:
+        if "醫生看" in name:
+            return wb[name]
+    return None
+
+
+def apply_doctor_reference_layout(ws, ref_ws) -> None:
+    if ref_ws is None:
+        return
+    max_col = min(ref_ws.max_column, ws.max_column)
+    for merged_range in list(ws.merged_cells.ranges):
+        if merged_range.min_row <= 3:
+            ws.unmerge_cells(str(merged_range))
+    for merged_range in ref_ws.merged_cells.ranges:
+        if merged_range.min_row <= 3 and merged_range.max_col <= max_col:
+            ws.merge_cells(str(merged_range))
+    for row in range(1, 4):
+        ws.row_dimensions[row].height = ref_ws.row_dimensions[row].height
+        for col in range(1, max_col + 1):
+            src = ref_ws.cell(row, col)
+            dst = ws.cell(row, col)
+            if dst.__class__.__name__ == "MergedCell":
+                continue
+            dst.value = src.value
+            if src.has_style:
+                dst._style = copy.copy(src._style)
+            dst.number_format = src.number_format
+            dst.font = copy.copy(src.font)
+            dst.fill = copy.copy(src.fill)
+            dst.border = copy.copy(src.border)
+            dst.alignment = copy.copy(src.alignment)
+            dst.protection = copy.copy(src.protection)
+    for col in range(1, max_col + 1):
+        letter = get_column_letter(col)
+        ws.column_dimensions[letter].width = ref_ws.column_dimensions[letter].width
+        ws.column_dimensions[letter].hidden = ref_ws.column_dimensions[letter].hidden
+
+
+def write_doctor_row_values(ws, row_index: int, values_by_col: Dict[int, Any], ref_ws) -> None:
+    max_col = max(ws.max_column, max(values_by_col.keys(), default=1))
+    if ref_ws is not None:
+        for col in range(1, max_col + 1):
+            src = ref_ws.cell(4, col) if col <= ref_ws.max_column else ref_ws.cell(4, ref_ws.max_column)
+            dst = ws.cell(row_index, col)
+            if src.has_style:
+                dst._style = copy.copy(src._style)
+            dst.number_format = src.number_format
+            dst.font = copy.copy(src.font)
+            dst.fill = copy.copy(src.fill)
+            dst.border = copy.copy(src.border)
+            dst.alignment = copy.copy(src.alignment)
+            dst.protection = copy.copy(src.protection)
+    else:
+        style_like_previous_row(ws, 3, row_index, max_col)
+    for col, value in values_by_col.items():
+        ws.cell(row_index, col).value = value
+
+
+def parse_lab_float(value: Any) -> Optional[float]:
+    try:
+        if value in (None, "", "-"):
+            return None
+        return float(str(value).strip())
+    except Exception:
+        return None
+
+
+def screening_display_value(rec: MemberRecord, key: str, today: dt.date) -> Any:
+    value = rec.screenings.get(key)
+    age = age_at_today(rec.bday, today)
+    if value not in (None, "", "-"):
+        parsed = parse_roc_or_ad_date(value)
+        if parsed and parsed.year == today.year:
+            return parsed
+        if parsed:
+            return "過期需受檢"
+        return value
+
+    if key == "成人健檢" and (age is not None and age < 40):
+        return "不需受檢"
+    if key == "子宮抹片" and (rec.sex == "男" or (age is not None and age < 30)):
+        return "不需受檢"
+    if key == "老人流感" and (age is not None and age < 65):
+        return "不需受檢"
+    if key == "糞便潛血" and (age is not None and (age < 50 or age > 74)):
+        return "不需受檢"
+    return "待受檢"
+
+
+def lab_result_display(value: Any, date_value: Any, threshold: float) -> Any:
+    parsed_value = parse_lab_float(value)
+    if parsed_value is None:
+        return None
+    parsed_date = parse_roc_or_ad_date(date_value)
+    if parsed_date and parsed_date.year == 2026 and parsed_value > threshold:
+        return f"{parsed_value:g}\n(已受檢未達控制)"
+    if (not parsed_date or parsed_date.year != 2026) and parsed_value > threshold:
+        return f"{parsed_value:g}\n(2026需受檢)"
+    return parsed_value
+
+
+def lab_date_display(value: Any, date_value: Any, threshold: float) -> Any:
+    parsed_date = parse_roc_or_ad_date(date_value)
+    if not parsed_date:
+        return None
+    parsed_value = parse_lab_float(value)
+    if parsed_date.year == 2026:
+        return parsed_date
+    if parsed_value is not None and parsed_value <= threshold:
+        return f"{parsed_date.isoformat()}\n(不需受檢)"
+    return parsed_date
+
+
+def apply_doctor_status_styles(ws, row_index: int) -> None:
+    pending_fill = PatternFill(fill_type="solid", fgColor="F4CCCC")
+    done_fill = PatternFill(fill_type="solid", fgColor="C6E0B4")
+    no_fill = PatternFill(fill_type=None)
+    for col in range(16, 21):
+        cell = ws.cell(row_index, col)
+        text = str(cell.value or "")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        if "待受檢" in text or "過期需受檢" in text:
+            cell.fill = pending_fill
+        elif isinstance(cell.value, (dt.date, dt.datetime)):
+            cell.fill = done_fill
+        else:
+            cell.fill = no_fill
+    for value_col, date_col in ((21, 22), (23, 24)):
+        value_cell = ws.cell(row_index, value_col)
+        date_cell = ws.cell(row_index, date_col)
+        if "未達控制" in str(value_cell.value or "") or "2026需受檢" in str(value_cell.value or ""):
+            value_cell.font = copy.copy(value_cell.font)
+            value_cell.font = Font(
+                name=value_cell.font.name,
+                sz=value_cell.font.sz,
+                bold=value_cell.font.bold,
+                italic=value_cell.font.italic,
+                color="FF0000",
+            )
+            value_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        if isinstance(date_cell.value, (dt.date, dt.datetime)) and date_cell.value.year == 2026:
+            date_cell.fill = done_fill
+        else:
+            date_cell.fill = no_fill
+
+
+def apply_doctor_prevention_fills(ws) -> None:
+    pending_fill = PatternFill(fill_type="solid", fgColor="F4CCCC")
+    done_fill = PatternFill(fill_type="solid", fgColor="C6E0B4")
+    no_fill = PatternFill(fill_type=None)
+    for row in range(4, ws.max_row + 1):
+        for col in range(16, 21):
+            cell = ws.cell(row, col)
+            text = str(cell.value or "")
+            if "待受檢" in text or "過期需受檢" in text or "不確定" in text or "年齡未知" in text:
+                cell.fill = pending_fill
+            elif isinstance(cell.value, (dt.date, dt.datetime)):
+                cell.fill = done_fill
+            else:
+                cell.fill = no_fill
 
 
 def display_pid(rec: MemberRecord) -> str:
@@ -751,14 +1049,91 @@ def write_row_values(ws, row_index: int, values_by_col: Dict[int, Any], style_ro
         ws.cell(row_index, col).value = value
 
 
+def build_screening_member_ids(records: Iterable[MemberRecord]) -> Dict[str, Set[str]]:
+    mapping = {
+        "adult": "成人健檢",
+        "pap": "子宮抹片",
+        "flu": "老人流感",
+        "fit": "糞便潛血",
+        "hep": "BC肝炎",
+    }
+    result: Dict[str, Set[str]] = {key: set() for key in mapping}
+    for rec in records:
+        if not rec.pid:
+            continue
+        for generic_key, local_key in mapping.items():
+            if has_screening_done(rec, local_key):
+                result[generic_key].add(rec.pid)
+    return result
+
+
+def apply_generic_derived_outputs(
+    wb,
+    ws,
+    row_records: Dict[int, MemberRecord],
+    data_start: int,
+    last_row: int,
+    today: dt.date,
+) -> Tuple[Dict[str, Optional[int]], Tuple[str, str, str, str]]:
+    cols = generic.detect_template_columns(ws, data_start)
+    meta: Dict[int, generic.MemberMeta] = {}
+    for row, rec in row_records.items():
+        age = age_at_today(rec.bday, today)
+        meta[row] = generic.MemberMeta(
+            row=row,
+            pid=rec.pid,
+            bday=rec.bday,
+            age=age if age is not None else -1,
+            e_code=generic.parse_disease_code(disease_code_output(rec.dmk_raw)),
+            ascvd=generic.parse_ascvd(rec.ascvd),
+        )
+
+    hba_candidates = generic._collect_hba_candidates(ws, cols, data_start, last_row)
+    ldl_candidates = generic._collect_ldl_candidates(ws, cols, data_start, last_row)
+    kpi_marks = generic.collect_kpi_mark_sets(
+        ws,
+        cols,
+        data_start,
+        last_row,
+        hba_candidates=hba_candidates,
+        ldl_candidates=ldl_candidates,
+    )
+    generic._compute_all_derived(
+        ws,
+        cols,
+        meta,
+        data_start,
+        last_row,
+        today,
+        kpi_marks=kpi_marks,
+        screening_member_ids=build_screening_member_ids(row_records.values()),
+    )
+    hba_main, hba_target = generic.calc_hba_kpi_ay_az(
+        ws, cols, data_start, last_row, hba_candidates=hba_candidates
+    )
+    ldl_main, ldl_target = generic.calc_ldl_percentiles(
+        ws, cols, data_start, last_row, ldl_candidates=ldl_candidates
+    )
+    generic._write_legacy_kpi_summary_cells(
+        ws,
+        hba_main_summary=hba_main,
+        hba_target_summary=hba_target,
+        ldl_main_summary=ldl_main,
+        ldl_target_summary=ldl_target,
+    )
+    return cols, (hba_main, hba_target, ldl_main, ldl_target)
+
+
 def populate_doctor_sheet(wb, records: List[MemberRecord], today: dt.date) -> None:
     if DOCTOR_SHEET_NAME not in wb.sheetnames:
         return
     ws = wb[DOCTOR_SHEET_NAME]
+    ref_ws = load_doctor_reference_sheet()
+    apply_doctor_reference_layout(ws, ref_ws)
     clear_sheet_data(ws, 4)
     for offset, rec in enumerate(records, start=4):
         total_score, breakdown, reminder, scores = score_record(rec)
-        write_row_values(
+        write_doctor_row_values(
             ws,
             offset,
             {
@@ -774,15 +1149,15 @@ def populate_doctor_sheet(wb, records: List[MemberRecord], today: dt.date) -> No
                 13: number_or_blank(rec.count_115),
                 14: avg_amount(rec.amount_114, 12),
                 15: avg_amount(rec.amount_115, 4),
-                16: screening_value(rec, "成人健檢"),
-                17: screening_value(rec, "子宮抹片"),
-                18: screening_value(rec, "老人流感"),
-                19: screening_value(rec, "糞便潛血"),
-                20: screening_value(rec, "BC肝炎"),
-                21: rec.health.get("hba_val"),
-                22: rec.health.get("hba_dt"),
-                23: rec.health.get("ldl_val"),
-                24: rec.health.get("ldl_dt"),
+                16: screening_display_value(rec, "成人健檢", today),
+                17: screening_display_value(rec, "子宮抹片", today),
+                18: screening_display_value(rec, "老人流感", today),
+                19: screening_display_value(rec, "糞便潛血", today),
+                20: screening_display_value(rec, "BC肝炎", today),
+                21: lab_result_display(rec.health.get("hba_val"), rec.health.get("hba_dt"), 7.0),
+                22: lab_date_display(rec.health.get("hba_val"), rec.health.get("hba_dt"), 7.0),
+                23: lab_result_display(rec.health.get("ldl_val"), rec.health.get("ldl_dt"), 120.0),
+                24: lab_date_display(rec.health.get("ldl_val"), rec.health.get("ldl_dt"), 120.0),
                 25: rec.health.get("uacr_val"),
                 26: rec.health.get("uacr_dt"),
                 28: rec.p4p.get("status"),
@@ -794,8 +1169,9 @@ def populate_doctor_sheet(wb, records: List[MemberRecord], today: dt.date) -> No
                 40: breakdown,
                 41: reminder,
             },
-            style_row=3,
+            ref_ws,
         )
+        apply_doctor_status_styles(ws, offset)
     ws.auto_filter.ref = ws.dimensions
     ws.freeze_panes = "A4"
 
@@ -804,6 +1180,20 @@ def populate_self_select_sheet(wb, records: List[MemberRecord]) -> None:
     if SELF_SELECT_SHEET_NAME not in wb.sheetnames:
         return
     ws = wb[SELF_SELECT_SHEET_NAME]
+    score_headers = {
+        22: "總分",
+        23: "固定就診次數分",
+        24: "醫療費用分",
+        25: "糖心腎管理分",
+        26: "預防保健分",
+    }
+    for col, header in score_headers.items():
+        ws.cell(1, col).value = header
+        if ws.cell(1, 21).has_style:
+            ws.cell(1, col)._style = copy.copy(ws.cell(1, 21)._style)
+        if ws.cell(2, 21).has_style:
+            ws.cell(2, col)._style = copy.copy(ws.cell(2, 21)._style)
+        ws.column_dimensions[get_column_letter(col)].hidden = True
     clear_sheet_data(ws, 3)
     selected_records = [rec for rec in records if rec.is_self_select]
     for offset, rec in enumerate(selected_records, start=3):
@@ -851,50 +1241,27 @@ def parse_lab_number(value: Any) -> Optional[float]:
         return None
 
 
-def populate_percentile_sheet(wb, records: List[MemberRecord]) -> None:
-    if PERCENTILE_SHEET_NAME not in wb.sheetnames:
-        return
-    ws = wb[PERCENTILE_SHEET_NAME]
-    clear_sheet_data(ws, 5)
-    ldl_rows = [
-        rec for rec in records
-        if parse_lab_number(rec.health.get("ldl_val")) is not None
-    ]
-    hba_rows = [
-        rec for rec in records
-        if parse_lab_number(rec.health.get("hba_val")) is not None
-    ]
-    ldl_rows.sort(key=lambda rec: parse_lab_number(rec.health.get("ldl_val")) or 0, reverse=True)
-    hba_rows.sort(key=lambda rec: parse_lab_number(rec.health.get("hba_val")) or 0, reverse=True)
-    ws["A1"] = f"LDL名單({len(ldl_rows)}人)"
-    ws["N1"] = f"HBA1C名單({len(hba_rows)}人)"
-    max_len = max(len(ldl_rows), len(hba_rows))
-    for index in range(max_len):
-        row_index = 5 + index
-        values: Dict[int, Any] = {}
-        if index < len(ldl_rows):
-            rec = ldl_rows[index]
-            values.update({
-                1: rec.name or "-",
-                2: date_or_blank(rec.bday),
-                3: display_pid(rec),
-                5: "；".join(sorted(rec.notes)) if rec.notes else None,
-                6: rec.health.get("ldl_val"),
-                7: rec.health.get("ldl_dt"),
-            })
-        if index < len(hba_rows):
-            rec = hba_rows[index]
-            values.update({
-                14: rec.name or "-",
-                15: date_or_blank(rec.bday),
-                16: display_pid(rec),
-                18: "；".join(sorted(rec.notes)) if rec.notes else None,
-                19: rec.health.get("hba_val"),
-                20: rec.health.get("hba_dt"),
-            })
-        write_row_values(ws, row_index, values, style_row=4)
-    ws.auto_filter.ref = ws.dimensions
-    ws.freeze_panes = "A5"
+def populate_percentile_sheet(
+    wb,
+    cols: Dict[str, Optional[int]],
+    data_start: int,
+    last_row: int,
+    summaries: Tuple[str, str, str, str],
+) -> None:
+    hba_main, hba_target, ldl_main, ldl_target = summaries
+    generic.populate_percentile_sheet(
+        wb,
+        hba_main,
+        hba_target,
+        ldl_main,
+        ldl_target,
+        cols,
+        data_start,
+        last_row,
+    )
+    if PERCENTILE_SHEET_NAME in wb.sheetnames:
+        wb[PERCENTILE_SHEET_NAME].sheet_view.showGridLines = True
+        generic._finalize_percentile_sheet_alignment(wb[PERCENTILE_SHEET_NAME])
 
 
 def create_output(source_dir: Path, output_dir: Optional[Path] = None) -> Path:
@@ -903,7 +1270,7 @@ def create_output(source_dir: Path, output_dir: Optional[Path] = None) -> Path:
     wb = openpyxl.load_workbook(template_path)
     ws = wb[TARGET_SHEET]
     generic.prepare_template_layout(ws)
-    chart_col, note_col = ensure_extra_columns(ws)
+    chart_col, note_col, self_select_col = ensure_extra_columns(ws)
 
     cols = {
         "name": find_output_col(ws, ["姓名"]),
@@ -917,6 +1284,10 @@ def create_output(source_dir: Path, output_dir: Optional[Path] = None) -> Path:
         "amount_114": find_output_col(ws, ["114年實際申報總額", "114年申報金額/月"]),
         "count_115": find_output_col(ws, ["115年就診次數"]),
         "amount_115": find_output_col(ws, ["115年實際申報總額", "115年申報金額/月"]),
+        "count_114_q1": find_output_col(ws, ["114年1-4月就診次數"]),
+        "count_115_q1": find_output_col(ws, ["115年1-4月就診次數"]),
+        "avg_amount_114_hidden": find_output_col(ws, ["114年月平均"]),
+        "avg_amount_115_hidden": find_output_col(ws, ["115年月平均"]),
         "ascvd": find_output_col(ws, ["ASCVD"]),
         "dmk": find_output_col(ws, ["疾病樣態分類(7類)", "疾病樣態編號"]),
         "hba_val": find_output_col(ws, ["最近一次HbA1c檢查結果(%)"]),
@@ -930,7 +1301,7 @@ def create_output(source_dir: Path, output_dir: Optional[Path] = None) -> Path:
         "score": find_output_col(ws, ["分數"]),
         "breakdown": find_output_col(ws, ["分數說明"]),
         "prevention_note": find_output_col(ws, ["預防保健提醒", "備註"]),
-        "is_self_select": find_output_col(ws, ["是否為自選會員"]),
+        "is_self_select": self_select_col,
     }
     screening_cols = {key: find_output_col(ws, [header]) for key, header in SCREENING_COLUMNS.items()}
 
@@ -947,8 +1318,10 @@ def create_output(source_dir: Path, output_dir: Optional[Path] = None) -> Path:
 
     row_index = data_start
     max_col = ws.max_column
+    row_records: Dict[int, MemberRecord] = {}
     for rec in sorted_records:
-        style_like_previous_row(ws, 2, row_index, max_col)
+        row_records[row_index] = rec
+        style_member_total_row(ws, row_index, max_col)
         age = age_at_today(rec.bday, today)
         total_score, breakdown, reminder, _scores = score_record(rec)
         set_if_col(ws, row_index, cols["name"], rec.name or "-")
@@ -962,8 +1335,12 @@ def create_output(source_dir: Path, output_dir: Optional[Path] = None) -> Path:
         set_if_col(ws, row_index, cols["amount_114"], number_or_blank(rec.amount_114))
         set_if_col(ws, row_index, cols["count_115"], number_or_blank(rec.count_115))
         set_if_col(ws, row_index, cols["amount_115"], number_or_blank(rec.amount_115))
+        set_if_col(ws, row_index, cols["count_114_q1"], number_or_blank(rec.count_114_q1))
+        set_if_col(ws, row_index, cols["count_115_q1"], number_or_blank(rec.count_115_q1))
+        set_if_col(ws, row_index, cols["avg_amount_114_hidden"], avg_amount(rec.amount_114_q1, 4))
+        set_if_col(ws, row_index, cols["avg_amount_115_hidden"], avg_amount(rec.amount_115_q1, 4))
         set_if_col(ws, row_index, cols["ascvd"], rec.ascvd)
-        set_if_col(ws, row_index, cols["dmk"], rec.dmk_raw)
+        set_if_col(ws, row_index, cols["dmk"], disease_code_output(rec.dmk_raw))
         set_if_col(ws, row_index, cols["hba_val"], rec.health.get("hba_val"))
         set_if_col(ws, row_index, cols["hba_dt"], rec.health.get("hba_dt"))
         set_if_col(ws, row_index, cols["ldl_val"], rec.health.get("ldl_val"))
@@ -999,9 +1376,15 @@ def create_output(source_dir: Path, output_dir: Optional[Path] = None) -> Path:
             )
     ws.auto_filter.ref = ws.dimensions
     ws.freeze_panes = "A3"
-    populate_doctor_sheet(wb, sorted_records, today)
+    ws.sheet_view.showGridLines = True
+    last_row = row_index - 1
+    generic_cols, summaries = apply_generic_derived_outputs(wb, ws, row_records, data_start, last_row, today)
+    generic.populate_doctor_sheet(wb, ws, generic_cols, data_start, last_row, today)
+    if DOCTOR_SHEET_NAME in wb.sheetnames:
+        apply_doctor_prevention_fills(wb[DOCTOR_SHEET_NAME])
+        generic._finalize_doctor_sheet_alignment(wb[DOCTOR_SHEET_NAME])
     populate_self_select_sheet(wb, sorted_records)
-    populate_percentile_sheet(wb, sorted_records)
+    populate_percentile_sheet(wb, generic_cols, data_start, last_row, summaries)
 
     if output_dir is None:
         output_dir = source_dir.parent
