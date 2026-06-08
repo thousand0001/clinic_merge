@@ -46,6 +46,8 @@ def _norm(value: Any) -> str:
     if value is None:
         return ""
     text = str(value).strip()
+    if text.startswith("'"):   # Excel text-prefix leaking from staging
+        text = text[1:]
     if text.endswith(".0") and text[:-2].isdigit():
         return text[:-2]
     return text
@@ -93,7 +95,7 @@ def build_from_bundle(bundle: DatasetBundle) -> Dict[str, Dict[str, Any]]:
             "高血糖":                      _norm(rec.hyperglycemia),
         })
         # disease_code / disease_class 由 disease_pattern 推算（只在尚未設定時寫入）
-        if not m.get("disease_code"):
+        if not m.get("disease_code") and rec.disease_pattern:
             disease_code = _disease_code_text(rec.disease_pattern)
             m["disease_code"] = disease_code
             ascvd_val = rec.ascvd if disease_code == "None" else "1"
@@ -109,8 +111,8 @@ def build_from_bundle(bundle: DatasetBundle) -> Dict[str, Dict[str, Any]]:
         "115_amount_q1":    0.0,
         "115_amount_total": 0.0,
         "last_visit":       "",
+        "115_months":       set(),   # per-person distinct 115 months (for O denominator)
     })
-    claim_months_115: set = set()
 
     for rec in bundle.monthly_claims:
         pid = rec.person_id
@@ -123,7 +125,7 @@ def build_from_bundle(bundle: DatasetBundle) -> Dict[str, Dict[str, Any]]:
             if rec.month <= 4:
                 agg["114_count_q1"] += count
         elif rec.roc_year == 115:
-            claim_months_115.add(rec.month)
+            agg["115_months"].add(rec.month)
             agg["115_count"]        += count
             agg["115_amount_total"] += amount
             if rec.month <= 4:
@@ -134,9 +136,9 @@ def build_from_bundle(bundle: DatasetBundle) -> Dict[str, Dict[str, Any]]:
             if iso > agg["last_visit"]:
                 agg["last_visit"] = iso
 
-    month_count_115 = max(len(claim_months_115), 1)
     for pid, sums in claims_agg.items():
         m = members.setdefault(pid, {"id": pid})
+        month_count_115 = max(len(sums["115_months"]), 1)
         m["114_count_q1"]   = sums["114_count_q1"] or None      # L
         m["114_count"]      = sums["114_count_full"] or None
         m["114_amount"]     = sums["114_amount_total"] or None
@@ -221,7 +223,7 @@ def build_from_bundle(bundle: DatasetBundle) -> Dict[str, Dict[str, Any]]:
     for pid, m in members.items():
         if not m.get("sex") and len(pid) >= 2:
             digit = pid[1:2]
-            m["sex"] = "M" if digit == "1" else ("F" if digit == "2" else "")
+            m["sex"] = "男" if digit in {"1", "8"} else ("女" if digit in {"2", "9"} else "")
         if m.get("disease_code") and not m.get("disease_class"):
             m["disease_class"] = _disease_class_text(
                 m["disease_code"], m.get("ASCVD", "")
