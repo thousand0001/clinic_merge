@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-新耀聖前置清洗 + 通用主程式包裝
+新耀聖前置清洗 + 共用核心包裝（0608）
 
 用途：
 - 將含「需照護名單」的雙工作表主檔拆成乾淨的 ascvd / 會員名單
 - 避免百分位計算分頁誤判成會員名單
-- 再呼叫 run_merge_通用（自動偵測最新版）完成輸出
+- 自動偵測日期最新的選會員共用核心與模板完成輸出
 """
 
 from __future__ import annotations
@@ -28,18 +28,26 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def _find_generic_script(script_dir: Path) -> Path:
-    candidates = sorted(script_dir.glob("run_merge_通用_*.py"), reverse=True)
+    def date_key(path: Path) -> tuple[int, str]:
+        match = re.search(r"(\d{4})(?=\.py$)", path.name)
+        return (int(match.group(1)) if match else -1, path.name)
+
+    candidates = sorted(
+        script_dir.glob("選會員_共用核心_*.py"),
+        key=date_key,
+        reverse=True,
+    )
     if not candidates:
-        raise RuntimeError("找不到通用程式 run_merge_通用_*.py")
+        raise RuntimeError("找不到共用核心 選會員_共用核心_*.py")
     return candidates[0]
 
 GENERIC_SCRIPT = _find_generic_script(SCRIPT_DIR)
 
 
 def _load_generic_module():
-    spec = importlib.util.spec_from_file_location("run_merge_generic", GENERIC_SCRIPT)
+    spec = importlib.util.spec_from_file_location("member_merge_core", GENERIC_SCRIPT)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"無法載入通用程式：{GENERIC_SCRIPT}")
+        raise RuntimeError(f"無法載入共用核心：{GENERIC_SCRIPT}")
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)

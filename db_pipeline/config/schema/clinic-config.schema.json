@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "clinic_merge clinic configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["clinic_code", "clinic_name", "source_system"],
+  "properties": {
+    "clinic_code": {
+      "type": "string",
+      "pattern": "^[0-9A-Za-z]{10}$"
+    },
+    "clinic_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_system": {
+      "enum": ["sm", "prospect", "hongcheng", "medical_saint", "tiaohe", "custom"]
+    },
+    "detection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "file_name_contains": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "file_name_regex": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "sheet_name_contains": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "header_contains": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "encodings": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "sheet_aliases": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {"type": "string"}
+      }
+    },
+    "column_aliases": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {"type": "string"}
+      }
+    },
+    "options": {
+      "type": "object"
+    }
+  }
+}
+

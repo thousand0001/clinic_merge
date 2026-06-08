@@ -1,11 +1,13 @@
+# 注意：此工具為舊版除錯用途，依賴的 run_merge_0326_V4_2.py 已不存在，目前無法執行。
+# 路徑寫死僅供歷史參考，移植時請勿直接使用。
 import importlib.util
 import sys
 from pathlib import Path
 
 
-SCRIPT_PATH = Path("/Users/thousand0001/PycharmProjects/clinic_merge/run_merge_0326_V4_2.py")
-SOURCE_PATH = "/Users/thousand0001/CloudStation/醫療群/梓寧給的資料/三月23資料/3501110482雙湖展望"
-TEMPLATE_PATH = "/Users/thousand0001/PycharmProjects/clinic_merge/選會員樣板0325.xlsx"
+SCRIPT_PATH = Path(__file__).resolve().parent.parent / "run_merge_0326_V4_2.py"  # 此檔已不存在
+SOURCE_PATH = ""   # 請改用命令列參數或資料夾選擇視窗
+TEMPLATE_PATH = ""  # 請改用命令列參數或資料夾選擇視窗
 
 
 def load_module():

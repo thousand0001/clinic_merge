@@ -39,9 +39,10 @@ TARGET_SHEET = "會員總表"
 PERCENTILE_SHEET_NAME = "百分位名單"
 DOCTOR_SHEET_NAME = "醫生看(從會員指標內容Key過來)"
 SELF_SELECT_SHEET_NAME = "自選名單(從會員指標內容Key過來)"
+# 醫生看格式參考檔：可用環境變數 CLINIC_DOCTOR_REF 指定，或放在專案目錄下 doctor_format_reference.xlsx
 DOCTOR_FORMAT_REFERENCE = Path(
-    "/Users/thousand0001/CloudStation/醫療群/梓寧給的資料/run_merge跑資料/方鼎系統/芝妍皮膚專科診所選會員_0525_1900.xlsx"
-)
+    os.getenv("CLINIC_DOCTOR_REF", "")
+) if os.getenv("CLINIC_DOCTOR_REF") else Path(__file__).resolve().parent / "doctor_format_reference.xlsx"
 SCREENING_COLUMNS = {
     "成人健檢": "成人健檢\n最後篩檢日",
     "子宮抹片": "子宮抹片最後篩檢日",

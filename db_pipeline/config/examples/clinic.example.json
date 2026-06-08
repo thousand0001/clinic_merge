@@ -1,0 +1,20 @@
+{
+  "clinic_code": "3531142947",
+  "clinic_name": "本一診所",
+  "source_system": "sm",
+  "detection": {
+    "file_name_contains": ["cliAssay", "cliP4pCase", "cliScores"],
+    "sheet_name_contains": ["IndexNo", "P4pCase"]
+  },
+  "encodings": ["utf-8-sig", "utf-16", "cp950", "big5"],
+  "sheet_aliases": {
+    "members": ["會員名單", "ascvd"],
+    "p4p_cases": ["P4pCase", "P4P收案"]
+  },
+  "column_aliases": {
+    "person_id": ["ID", "身分證號", "身份證號碼"],
+    "name": ["姓名", "會員姓名"]
+  },
+  "options": {}
+}
+
