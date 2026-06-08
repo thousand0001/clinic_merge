@@ -37,12 +37,18 @@ def _validate_person_ids(
         person_id = getattr(record, "person_id", "")
         trace = getattr(record, "trace")
         if not TW_ID_RE.fullmatch(person_id):
+            severity = "warning" if person_id.startswith("chart:") else "error"
+            message = (
+                f"病歷號暫代識別碼（身分證號待補）：{person_id!r}"
+                if person_id.startswith("chart:")
+                else f"身分證號格式不符（應為英文字母開頭＋9位數字）：{person_id!r}"
+            )
             report.issues.append(
                 _issue_for_trace(
-                    "error",
+                    severity,
                     dataset,
                     "invalid_person_id",
-                    f"身分證號格式不符（應為英文字母開頭＋9位數字）：{person_id!r}",
+                    message,
                     trace,
                 )
             )

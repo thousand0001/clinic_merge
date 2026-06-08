@@ -87,6 +87,8 @@ def _show_result(summary: dict, dry_run: bool) -> None:
         issues = summary.get("validation", {}).get("issues", [])
         errors   = [i for i in issues if i["severity"] == "error"]
         warnings = [i for i in issues if i["severity"] == "warning"]
+        total_errors   = summary.get("validation", {}).get("error_count", len(errors))
+        total_warnings = summary.get("validation", {}).get("warning_count", len(warnings))
 
         lines = [
             mode,
@@ -102,8 +104,8 @@ def _show_result(summary: dict, dry_run: bool) -> None:
             "── 資料筆數 ──",
         ] + [f"  {k}: {v}" for k, v in counts.items() if v > 0] + [
             "",
-            f"── 驗證：{'✅ 通過' if not errors else f'❌ {len(errors)} 個錯誤'} "
-            f"{'⚠️ ' + str(len(warnings)) + ' 個警告' if warnings else ''}──",
+            f"── 驗證：{'✅ 通過' if not errors else f'❌ {total_errors} 個錯誤'} "
+            f"{'⚠️ ' + str(total_warnings) + ' 個警告' if total_warnings else ''}──",
         ]
         if errors:
             lines += [""] + [f"  ❌ {e['message']}" for e in errors[:5]]
@@ -153,8 +155,10 @@ def run(
             "unmatched_rows":   parse_result.coverage.unmatched_rows,
         },
         "validation": {
-            "is_valid":    is_valid,
-            "issue_count": len(all_issues),
+            "is_valid":      is_valid,
+            "issue_count":   len(all_issues),
+            "error_count":   sum(1 for i in all_issues if i.severity == "error"),
+            "warning_count": sum(1 for i in all_issues if i.severity == "warning"),
             "issues": [
                 {
                     "severity":     i.severity,

@@ -278,7 +278,8 @@ class SmParser:
                         code="unmatched_source_rows",
                         message=(
                             f"費用次數檔有 {count} 筆姓名＋生日無法比對照護名單"
-                            "（可能為非家醫計畫病患或姓名格式差異），已略過。"
+                            "（一般門診病患，非家醫計畫會員），已以病歷號作為暫代識別碼寫入，"
+                            "身分證號欄位待後續補全。"
                         ),
                     )
                 )
@@ -434,6 +435,7 @@ class SmParser:
                 count_col = _find_column(headers, ("來診次數", "次數"))
                 amount_col = _find_column(headers, ("申報總金額", "總額"))
                 last_visit_col = _find_column(headers, ("最後回診日", "最後就診日"))
+                chart_col = _find_column(headers, ("病歷號",))
                 if None in (name_col, birth_col, count_col, amount_col):
                     continue
 
@@ -449,9 +451,13 @@ class SmParser:
                         (name, birth_date.isoformat()),
                         set(),
                     )
-                    if len(person_ids) != 1:
+                    if len(person_ids) == 1:
+                        person_id = next(iter(person_ids))
+                    else:
+                        chart_raw = values[chart_col] if chart_col is not None else None
+                        chart_no = str(int(chart_raw)) if chart_raw is not None else ""
+                        person_id = f"chart:{chart_no}" if chart_no else ""
                         unmatched += 1
-                        continue
                     bundle.monthly_claims.append(
                         MonthlyClaimRecord(
                             trace=_trace(
@@ -463,7 +469,7 @@ class SmParser:
                                 row_no,
                                 values,
                             ),
-                            person_id=next(iter(person_ids)),
+                            person_id=person_id,
                             roc_year=int(match.group(1)),
                             month=int(match.group(2)),
                             visit_count=parse_decimal(values[count_col]),
