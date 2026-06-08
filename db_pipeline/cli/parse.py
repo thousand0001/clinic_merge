@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from db_pipeline.config.models import load_clinic_config
-from db_pipeline.parsers.sm import SmParser
+from db_pipeline.parsers import get_parser
 from db_pipeline.validation.validator import validate_bundle
 
 
@@ -24,10 +24,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not source_dir.is_dir():
         parser.error(f"來源資料夾不存在：{source_dir}")
     config = load_clinic_config(args.config)
-    parsers = {"sm": SmParser()}
-    source_parser = parsers.get(config.source_system)
-    if source_parser is None:
-        raise ValueError(f"尚未實作解析器：{config.source_system}")
+    source_parser = get_parser(config.source_system)
 
     result = source_parser.parse(source_dir, config, args.batch_id)
     validation = validate_bundle(result.bundle)
