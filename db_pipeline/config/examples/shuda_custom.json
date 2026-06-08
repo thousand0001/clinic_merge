@@ -1,0 +1,10 @@
+{
+  "clinic_code": "4001020028",
+  "clinic_name": "書田診所",
+  "source_system": "custom",
+  "detection": {},
+  "encodings": ["utf-8-sig", "utf-16", "cp950", "big5"],
+  "sheet_aliases": {},
+  "column_aliases": {},
+  "options": {}
+}
