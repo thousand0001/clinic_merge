@@ -57,7 +57,7 @@ MEMBER_FIELDS = {
     "hyperlipidemia":           ("高血脂",),
     "hyperglycemia":            ("高血糖",),
 }
-MONTH_CODE_RE = re.compile(r"(?<!\d)(1(?:14|15)\d{2})(?!\d)")
+MONTH_CODE_RE = re.compile(r"(?<!\d)(1(?:14|15)(?:0[1-9]|1[0-2]))(?!\d)")
 TW_ID_RE      = re.compile(r"[A-Z][12]\d{8}")
 XLSX_SUFFIXES = {".xlsx", ".xlsm"}
 
@@ -200,18 +200,27 @@ class HongchengParser:
             issues.append(ValidationIssue(
                 severity="error", dataset="monthly_claims",
                 code="claim_not_mapped",
-                message="找到費用來源檔，但沒有任何資料成功對應會員。"))
+                message=(
+                    "費用來源檔已找到，但 0 筆可對應照護名單。"
+                    "請確認照護名單與費用檔是否屬同一診所同一期別。"
+                )))
         if pdf_files:
             issues.append(ValidationIssue(
                 severity="warning", dataset="monthly_claims",
                 code="pdf_claims_skipped",
-                message=f"有 {len(pdf_files)} 個次數 PDF 尚未解析（v2 補上）。"))
+                message=(
+                    f"有 {len(pdf_files)} 個次數 PDF 尚未解析，這部分費用次數暫缺"
+                    "（功能將於 v2 版補上）。"
+                )))
         for dataset, cnt in coverage.unmatched_rows.items():
             if cnt:
                 issues.append(ValidationIssue(
                     severity="warning", dataset=dataset,
                     code="unmatched_source_rows",
-                    message=f"有 {cnt} 筆來源資料無法唯一對應會員。"))
+                    message=(
+                        f"費用次數檔有 {cnt} 筆姓名＋生日無法比對照護名單"
+                        "（可能為非家醫計畫病患或姓名格式差異），已略過。"
+                    )))
 
         return ParseResult(bundle=bundle, coverage=coverage, issues=issues)
 

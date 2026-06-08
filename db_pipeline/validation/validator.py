@@ -42,7 +42,7 @@ def _validate_person_ids(
                     "error",
                     dataset,
                     "invalid_person_id",
-                    f"身分證格式不正確：{person_id}",
+                    f"身分證號格式不符（應為英文字母開頭＋9位數字）：{person_id!r}",
                     trace,
                 )
             )
@@ -68,7 +68,7 @@ def validate_bundle(bundle: DatasetBundle) -> ValidationReport:
                     "error",
                     "monthly_claims",
                     "invalid_roc_year",
-                    f"不支援的民國年度：{record.roc_year}",
+                    f"民國年度超出支援範圍（僅接受 114、115）：{record.roc_year}",
                     record.trace,
                 )
             )
@@ -78,7 +78,7 @@ def validate_bundle(bundle: DatasetBundle) -> ValidationReport:
                     "error",
                     "monthly_claims",
                     "invalid_month",
-                    f"月份超出範圍：{record.month}",
+                    f"月份超出範圍（需為 1～12）：{record.month}",
                     record.trace,
                 )
             )

@@ -24,7 +24,7 @@ import os
 import shutil
 import subprocess
 from decimal import Decimal, InvalidOperation
-from typing import Any, List, Sequence
+from typing import Any, List, Optional, Sequence
 
 from db_pipeline.datasets.models import (
     DatasetBundle,
@@ -101,29 +101,43 @@ def _run_query(sql: str) -> str:
 
 
 # ── CSV 產生工具 ──────────────────────────────────────────────────────────────
+def _clean_str(v: Any) -> str:
+    """轉字串並移除可能讓 COPY 出錯的換行與控制字元。"""
+    s = str(v)
+    # 將換行符號換成空格（Excel 欄位可能含 \n）
+    s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return s
+
+
 def _csv_block(rows: List[List[Any]]) -> str:
-    """rows → CSV 字串（無表頭）。None → 空字串，bool → t/f。"""
-    buf = io.StringIO()
-    writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+    """rows → CSV 字串（無表頭）。
+    None → 未引用空欄位（PostgreSQL CSV 模式視為 NULL），
+    bool → t/f（引用），其餘全部引用並逸出內部雙引號。
+    """
+    lines = []
     for row in rows:
-        writer.writerow([
-            "" if v is None
-            else ("t" if v else "f") if isinstance(v, bool)
-            else str(v)
-            for v in row
-        ])
-    return buf.getvalue()
+        fields = []
+        for v in row:
+            if v is None:
+                fields.append("")
+            elif isinstance(v, bool):
+                fields.append('"t"' if v else '"f"')
+            else:
+                s = _clean_str(v).replace('"', '""')
+                fields.append(f'"{s}"')
+        lines.append(",".join(fields))
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
-def _dt(value: Any) -> str:
+def _dt(value: Any) -> Optional[str]:
     if value is None:
-        return ""
+        return None
     return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
 
-def _dec(value: Any) -> str:
+def _dec(value: Any) -> Optional[str]:
     if value is None:
-        return ""
+        return None
     return str(value) if isinstance(value, Decimal) else str(value)
 
 
@@ -154,7 +168,7 @@ def _member_row(batch_id: str, clinic_id: int, rec: MemberRecord) -> List[Any]:
         rec.phone, rec.mobile, rec.address,
         rec.case_category,                          # member_type
         rec.disease_pattern, rec.disease_pattern,   # disease_code, disease_text
-        rec.ascvd, "",                              # ascvd, last_visit_date
+        rec.ascvd, None,                            # ascvd, last_visit_date
         raw, rec.trace.raw_row_hash,
     ]
 
@@ -167,7 +181,7 @@ def _claim_row(batch_id: str, clinic_id: int, rec: MonthlyClaimRecord) -> List[A
     natural_key = f"{clinic_id}_{rec.person_id}_{rec.roc_year}{rec.month:02d}"
     return [
         batch_id, clinic_id, rec.trace.source_row,
-        rec.person_id, rec.person_id, "", "", "",  # id, normalized, chart, name, birth
+        rec.person_id, rec.person_id, "", "", None,  # id, normalized, chart, name, birth_date
         _dt(rec.last_visit_date),                  # service_date
         rec.roc_year, rec.month,
         _dec(rec.visit_count), _dec(rec.amount),
@@ -191,13 +205,13 @@ def _flag_row(batch_id: str, clinic_id: int, rec: MemberSelectionRecord) -> List
 def _p4p_case_row(batch_id: str, clinic_id: int, rec: P4PCaseRecord) -> List[Any]:
     raw = json.dumps({"source_file": rec.trace.source_file, "source_system": rec.trace.source_system}, ensure_ascii=False)
     return [batch_id, clinic_id, rec.person_id, rec.plan, rec.status,
-            _dt(rec.enrolled_at), "", "", "", raw, rec.trace.raw_row_hash]
+            _dt(rec.enrolled_at), None, None, "", raw, rec.trace.raw_row_hash]
 
 
 def _p4p_track_row(batch_id: str, clinic_id: int, rec: P4PTrackRecord) -> List[Any]:
     raw = json.dumps({"source_file": rec.trace.source_file, "source_system": rec.trace.source_system}, ensure_ascii=False)
     return [batch_id, clinic_id, rec.person_id, rec.plan, "",
-            "", _dt(rec.last_tracked_at), _dt(rec.next_track_at), rec.overdue,
+            None, _dt(rec.last_tracked_at), _dt(rec.next_track_at), rec.overdue,
             raw, rec.trace.raw_row_hash]
 
 
@@ -209,9 +223,9 @@ def _screening_row(batch_id: str, clinic_id: int, rec: ScreeningRecord) -> List[
 def _lab_row(batch_id: str, clinic_id: int, rec: LabResultRecord) -> List[Any]:
     raw = json.dumps({"source_file": rec.trace.source_file, "source_system": rec.trace.source_system}, ensure_ascii=False)
     try:
-        result_val = str(Decimal(str(rec.result_value))) if rec.result_value else ""
+        result_val = str(Decimal(str(rec.result_value))) if rec.result_value else None
     except (InvalidOperation, Exception):
-        result_val = ""
+        result_val = None
     return [batch_id, clinic_id, rec.person_id, rec.test_code, result_val, _dt(rec.tested_at), raw, rec.trace.raw_row_hash]
 
 

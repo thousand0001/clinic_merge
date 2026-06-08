@@ -5,6 +5,7 @@
 
 from .contracts     import ParseCoverage, ParseResult, SourceParser
 from .sm            import SmParser
+from .new_sm        import NewSmParser
 from .prospect      import ProspectParser
 from .medical_saint import MedicalSaintParser
 from .tiaohe        import TiaoheParser
@@ -14,6 +15,7 @@ from .custom        import CustomParser
 # source_system → parser 實例的對照表
 PARSER_REGISTRY: dict = {
     "sm":            SmParser(),
+    "new_sm":        NewSmParser(),
     "prospect":      ProspectParser(),
     "medical_saint": MedicalSaintParser(),
     "tiaohe":        TiaoheParser(),
@@ -35,7 +37,7 @@ def get_parser(source_system: str) -> SourceParser:
 
 __all__ = [
     "ParseCoverage", "ParseResult", "SourceParser",
-    "SmParser", "ProspectParser", "MedicalSaintParser",
+    "SmParser", "NewSmParser", "ProspectParser", "MedicalSaintParser",
     "TiaoheParser", "HongchengParser", "CustomParser",
     "PARSER_REGISTRY", "get_parser",
 ]

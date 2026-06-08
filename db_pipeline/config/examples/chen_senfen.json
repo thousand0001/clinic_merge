@@ -1,0 +1,13 @@
+{
+  "clinic_code": "3501110080",
+  "clinic_name": "陳森豊診所",
+  "source_system": "prospect",
+  "detection": {
+    "file_name_contains": ["R11440", "照護名單", "自選會員"],
+    "file_name_regex": ["R11440.+\\.xlsx"]
+  },
+  "encodings": ["utf-8-sig", "utf-16", "cp950"],
+  "sheet_aliases": {},
+  "column_aliases": {},
+  "options": {}
+}

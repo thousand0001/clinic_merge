@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 SUPPORTED_SOURCE_SYSTEMS = {
     "sm",
+    "new_sm",
     "prospect",
     "hongcheng",
     "medical_saint",

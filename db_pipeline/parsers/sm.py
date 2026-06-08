@@ -263,7 +263,10 @@ class SmParser:
                     severity="error",
                     dataset="monthly_claims",
                     code="claim_source_not_mapped",
-                    message="找到門診次數費用來源檔，但沒有任何資料成功對應會員。",
+                    message=(
+                        "費用次數來源檔（R11440）已找到，但 0 筆可對應照護名單。"
+                        "請確認照護名單與費用檔是否屬同一診所同一期別。"
+                    ),
                 )
             )
         for dataset, count in coverage.unmatched_rows.items():
@@ -273,7 +276,10 @@ class SmParser:
                         severity="warning",
                         dataset=dataset,
                         code="unmatched_source_rows",
-                        message=f"有 {count} 筆來源資料無法唯一對應會員。",
+                        message=(
+                            f"費用次數檔有 {count} 筆姓名＋生日無法比對照護名單"
+                            "（可能為非家醫計畫病患或姓名格式差異），已略過。"
+                        ),
                     )
                 )
 

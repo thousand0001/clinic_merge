@@ -1,0 +1,10 @@
+{
+  "clinic_code": "3531030095",
+  "clinic_name": "吉安小兒科診所",
+  "source_system": "new_sm",
+  "detection": {},
+  "encodings": ["utf-8-sig", "cp950"],
+  "sheet_aliases": {},
+  "column_aliases": {},
+  "options": {}
+}
