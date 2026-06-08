@@ -312,3 +312,38 @@
 下一步：
 
 1. Phase 8：Operations & output UI（診所選擇、批次管理、一鍵產出）。
+
+## 2026-06-09 第 8 階段 Operations & output UI
+
+已建立：
+
+- `db_pipeline/cli/output.py`：一鍵產出 CLI。
+  - `--clinic-code CODE`：自動取最新 validated/published 批次。
+  - `--batch-id UUID`：指定批次（支援跨診所回溯比對）。
+  - `--template <範本路徑> --dest <輸出路徑>`。
+  - 實測：鈞安（3754 筆）、蘆洲大愛（3102 筆）均成功產出。
+- `db_pipeline/cli/batches.py`：批次清單 CLI。
+  - `--clinic-code`（篩診所）、`--status`（篩狀態）、`--limit`（顯示筆數）。
+  - 欄位：診所名稱、代碼、來源系統、狀態、批次 ID、開始/驗證時間。
+
+使用方式：
+```bash
+# 列出所有 validated 批次
+python -m db_pipeline.cli.batches --status validated
+
+# 一鍵產出（最新批次）
+python -m db_pipeline.cli.output \
+    --clinic-code 3501186011 \
+    --template 選會員模板0526.xlsx
+
+# 指定批次產出
+python -m db_pipeline.cli.output \
+    --batch-id 2912a96f-0d00-5ed9-968a-523fca63425e \
+    --template 選會員模板0526.xlsx \
+    --dest /tmp/鈞安_output.xlsx
+```
+
+下一步：
+
+1. Phase 7 實際 Excel 比對：請使用者以舊流程跑鈞安或蘆洲大愛來源資料夾，再用 `compare_common_output.py` 比對。
+2. Phase 9：切換評估（正式流程切換條件確認）。
