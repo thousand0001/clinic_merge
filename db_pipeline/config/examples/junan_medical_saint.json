@@ -1,0 +1,10 @@
+{
+  "clinic_code": "3501186011",
+  "clinic_name": "鈞安診所",
+  "source_system": "medical_saint",
+  "detection": {},
+  "encodings": ["utf-8-sig", "cp950", "big5"],
+  "sheet_aliases": {},
+  "column_aliases": {},
+  "options": {}
+}

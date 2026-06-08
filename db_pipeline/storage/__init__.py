@@ -34,6 +34,8 @@ from db_pipeline.datasets.models import (
     MonthlyClaimRecord,
     P4PCaseRecord,
     P4PTrackRecord,
+    RawSourceFile,
+    RawSourceRow,
     ScreeningRecord,
 )
 from db_pipeline.storage.contracts import StageResult
@@ -229,6 +231,32 @@ def _lab_row(batch_id: str, clinic_id: int, rec: LabResultRecord) -> List[Any]:
     return [batch_id, clinic_id, rec.person_id, rec.test_code, result_val, _dt(rec.tested_at), raw, rec.trace.raw_row_hash]
 
 
+def _raw_file_row(rec: RawSourceFile) -> List[Any]:
+    return [
+        rec.relative_path,
+        rec.file_name,
+        rec.file_size,
+        rec.sha256,
+        _dt(rec.file_mtime),
+        rec.data_type,
+    ]
+
+
+def _raw_source_row(
+    rec: RawSourceRow,
+    source_hashes: dict,
+) -> List[Any]:
+    return [
+        rec.source_file,
+        rec.file_name,
+        source_hashes.get(rec.source_file, ""),
+        rec.sheet_name,
+        rec.row_no,
+        json.dumps(rec.row_data, ensure_ascii=False),
+        rec.row_hash,
+    ]
+
+
 # ── COPY 區塊 ─────────────────────────────────────────────────────────────────
 def _copy_block(table: str, columns: Sequence[str], rows: List[List[Any]]) -> str:
     if not rows:
@@ -302,6 +330,15 @@ class PostgresStagingWriter:
         )
         screening_rows = [_screening_row(batch_id, clinic_id, r) for r in bundle.screenings]
         lab_rows       = [_lab_row(batch_id, clinic_id, r) for r in bundle.lab_results]
+        raw_file_rows  = [_raw_file_row(r) for r in bundle.raw_source_files]
+        source_hashes  = {
+            record.relative_path: record.sha256
+            for record in bundle.raw_source_files
+        }
+        raw_rows       = [
+            _raw_source_row(record, source_hashes)
+            for record in bundle.raw_source_rows
+        ]
 
         return "".join([
             "BEGIN;\n\n",
@@ -311,6 +348,62 @@ class PostgresStagingWriter:
             f"VALUES ('{bid}', {clinic_id}, '{_esc(source_system)}', 'replace_scope', '{{}}', 'staged', "
             f"'{_esc(source_root)}', '{_esc(requested_by)}') "
             f"ON CONFLICT (batch_id) DO UPDATE SET status='staged', started_at=now(), message=NULL;\n\n",
+
+            "CREATE TEMP TABLE tmp_db_pipeline_source_files (\n"
+            "  file_path TEXT,\n"
+            "  file_name TEXT,\n"
+            "  file_size BIGINT,\n"
+            "  sha256 TEXT,\n"
+            "  file_mtime TIMESTAMPTZ,\n"
+            "  data_type TEXT\n"
+            ") ON COMMIT DROP;\n\n",
+
+            _copy_block("tmp_db_pipeline_source_files", [
+                "file_path", "file_name", "file_size",
+                "sha256", "file_mtime", "data_type",
+            ], raw_file_rows),
+
+            "INSERT INTO meta.source_files (\n"
+            "  clinic_id, batch_id, file_path, file_name,\n"
+            "  file_size, sha256, file_mtime, data_type\n"
+            ")\n"
+            f"SELECT {clinic_id}, '{bid}', file_path, file_name,\n"
+            "       file_size, sha256, file_mtime, data_type\n"
+            "FROM tmp_db_pipeline_source_files\n"
+            "ON CONFLICT (clinic_id, file_path, COALESCE(sha256, '')) DO UPDATE\n"
+            "SET batch_id = EXCLUDED.batch_id,\n"
+            "    file_name = EXCLUDED.file_name,\n"
+            "    file_size = EXCLUDED.file_size,\n"
+            "    file_mtime = EXCLUDED.file_mtime,\n"
+            "    data_type = EXCLUDED.data_type;\n\n",
+
+            "CREATE TEMP TABLE tmp_db_pipeline_raw_rows (\n"
+            "  file_path TEXT,\n"
+            "  file_name TEXT,\n"
+            "  sha256 TEXT,\n"
+            "  sheet_name TEXT,\n"
+            "  row_no INTEGER,\n"
+            "  row_data JSONB,\n"
+            "  row_hash TEXT\n"
+            ") ON COMMIT DROP;\n\n",
+
+            _copy_block("tmp_db_pipeline_raw_rows", [
+                "file_path", "file_name", "sha256", "sheet_name",
+                "row_no", "row_data", "row_hash",
+            ], raw_rows),
+
+            f"DELETE FROM raw.uploaded_rows WHERE batch_id='{bid}';\n",
+            "INSERT INTO raw.uploaded_rows (\n"
+            "  batch_id, clinic_id, source_file_id,\n"
+            "  file_name, sheet_name, row_no, row_data, row_hash\n"
+            ")\n"
+            f"SELECT '{bid}', {clinic_id}, sf.source_file_id,\n"
+            "       r.file_name, r.sheet_name, r.row_no, r.row_data, r.row_hash\n"
+            "FROM tmp_db_pipeline_raw_rows r\n"
+            "LEFT JOIN meta.source_files sf\n"
+            f"  ON sf.clinic_id = {clinic_id}\n"
+            " AND sf.file_path = r.file_path\n"
+            " AND COALESCE(sf.sha256, '') = COALESCE(r.sha256, '');\n\n",
 
             f"DELETE FROM staging.members     WHERE batch_id='{bid}' AND clinic_id={clinic_id};\n",
             f"DELETE FROM staging.claims      WHERE batch_id='{bid}' AND clinic_id={clinic_id};\n",

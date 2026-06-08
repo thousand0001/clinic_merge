@@ -36,9 +36,9 @@ from db_pipeline.normalization import (
     parse_decimal,
     stable_row_hash,
 )
-from db_pipeline.parsers.contracts import ParseCoverage, ParseResult
+from db_pipeline.parsers.解析器介面 import ParseCoverage, ParseResult
 from db_pipeline.validation.models import ValidationIssue
-from .sm import (
+from .耀聖 import (
     ID_HEADERS,
     MEMBER_FIELDS,
     _find_column,

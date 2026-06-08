@@ -41,7 +41,8 @@ from db_pipeline.normalization import (
     parse_decimal,
     stable_row_hash,
 )
-from db_pipeline.parsers.contracts import ParseCoverage, ParseResult
+from db_pipeline.parsers.解析器介面 import ParseCoverage, ParseResult
+from db_pipeline.parsers.新耀聖 import NewSmParser
 from db_pipeline.validation.models import ValidationIssue
 
 # ── 常數 ──────────────────────────────────────────────────────────────────────
@@ -66,6 +67,16 @@ TW_ID_RE          = re.compile(r"[A-Z][12]\d{8}")
 ILLEGAL_CTRL_RE   = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
 XLSX_SUFFIXES     = {".xlsx", ".xlsm"}
 CSV_ENCODINGS     = ["utf-8-sig", "utf-16", "cp950", "big5"]
+SCREENING_FILENAME_MAP = {
+    "bc肝": "肝炎篩檢",
+    "子抹": "子宮抹片",
+    "子宮頸": "子宮抹片",
+    "成健": "成人健檢",
+    "成人": "成人健檢",
+    "糞便": "糞便潛血",
+    "老流": "老人流感",
+    "老感": "老人流感",
+}
 
 
 # ── 工具函式 ──────────────────────────────────────────────────────────────────
@@ -92,6 +103,14 @@ def _find_header_row(ws: Any, required: Sequence[Sequence[str]]) -> Optional[int
 def _month_code(text: str) -> Optional[str]:
     m = MONTH_CODE_RE.search(text)
     return m.group(1) if m else None
+
+
+def _screening_type(path: Path) -> Optional[str]:
+    name = path.stem.lower()
+    for token, screening_type in SCREENING_FILENAME_MAP.items():
+        if token in name:
+            return screening_type
+    return None
 
 
 def _read_csv_rows(path: Path) -> List[List[str]]:
@@ -154,7 +173,10 @@ class TiaoheParser:
                 coverage.parsed_files += 1
                 coverage.parsed_rows["members"] = coverage.parsed_rows.get("members", 0) + n
 
-        existing_ids = {m.person_id for m in bundle.members}
+        removed_members = self._dedupe_roster(bundle)
+        if removed_members:
+            coverage.parsed_rows["members"] -= removed_members
+        roster_ids = {m.person_id for m in bundle.members}
 
         # 2. 次數 xlsx（R11440次數/ 或 次數/ 或 主次代碼/）→ monthly_claims
         count_files: List[Path] = []
@@ -175,14 +197,14 @@ class TiaoheParser:
                 count_files.append(p)
 
         for path in count_files:
-            parsed, unmatched = self._parse_count_workbook(
-                source_dir, path, config, batch_id, existing_ids, bundle)
-            if parsed or unmatched:
+            parsed, unlinked = self._parse_count_workbook(
+                source_dir, path, config, batch_id, roster_ids, bundle)
+            if parsed:
                 coverage.parsed_files += 1
                 coverage.parsed_rows["monthly_claims"] = (
                     coverage.parsed_rows.get("monthly_claims", 0) + parsed)
-                coverage.unmatched_rows["monthly_claims"] = (
-                    coverage.unmatched_rows.get("monthly_claims", 0) + unmatched)
+                coverage.unlinked_rows["monthly_claims"] = (
+                    coverage.unlinked_rows.get("monthly_claims", 0) + unlinked)
 
         # 3. 自選 / 不要 CSV（BIG5）
         select_csvs = [
@@ -197,26 +219,75 @@ class TiaoheParser:
             and any(kw in p.name.upper() for kw in ("115X", "不要"))
         ]
         for path in select_csvs:
-            n, u = self._parse_selection_csv(
-                source_dir, path, config, batch_id, existing_ids, bundle, "self_selected_115")
-            if n or u:
+            parsed, unlinked = self._parse_selection_csv(
+                source_dir, path, config, batch_id, roster_ids, bundle, "self_selected_115")
+            if parsed:
                 coverage.parsed_files += 1
                 coverage.parsed_rows["member_selections"] = (
-                    coverage.parsed_rows.get("member_selections", 0) + n)
-                coverage.unmatched_rows["member_selections"] = (
-                    coverage.unmatched_rows.get("member_selections", 0) + u)
+                    coverage.parsed_rows.get("member_selections", 0) + parsed)
+                coverage.unlinked_rows["member_selections"] = (
+                    coverage.unlinked_rows.get("member_selections", 0) + unlinked)
         for path in exclude_csvs:
-            n, u = self._parse_selection_csv(
-                source_dir, path, config, batch_id, existing_ids, bundle, "excluded_115x")
-            if n or u:
+            parsed, unlinked = self._parse_selection_csv(
+                source_dir, path, config, batch_id, roster_ids, bundle, "excluded_115x")
+            if parsed:
                 coverage.parsed_files += 1
+                coverage.parsed_rows["member_selections"] = (
+                    coverage.parsed_rows.get("member_selections", 0) + parsed)
+                coverage.unlinked_rows["member_selections"] = (
+                    coverage.unlinked_rows.get("member_selections", 0) + unlinked)
 
-        # 4. 跳過
-        parsed_paths = set(roster_files + count_files + select_csvs + exclude_csvs)
+        # 4. P4P、篩檢、個案健康管理
+        p4p_case_files = [
+            p for p in files
+            if p.suffix.lower() in XLSX_SUFFIXES
+            and re.search(r"P4P.*收案|P4p.*收案", p.name)
+        ]
+        p4p_track_files = [
+            p for p in files
+            if p.suffix.lower() in XLSX_SUFFIXES
+            and re.search(r"P4P.*追蹤|P4p.*追蹤", p.name)
+        ]
+        health_files = [
+            p for p in files
+            if p.suffix.lower() in XLSX_SUFFIXES and "個案健康管理" in p.name
+        ]
+        screening_files = [
+            p for p in files
+            if p.suffix.lower() in XLSX_SUFFIXES and _screening_type(p) is not None
+        ]
+        auxiliary = NewSmParser()
+        for path in p4p_case_files:
+            n = auxiliary._parse_p4p_cases(source_dir, path, config, batch_id, bundle)
+            coverage.parsed_files += 1
+            coverage.parsed_rows["p4p_cases"] = coverage.parsed_rows.get("p4p_cases", 0) + n
+        for path in p4p_track_files:
+            n = auxiliary._parse_p4p_tracks(source_dir, path, config, batch_id, bundle)
+            coverage.parsed_files += 1
+            coverage.parsed_rows["p4p_tracks"] = coverage.parsed_rows.get("p4p_tracks", 0) + n
+        for path in screening_files:
+            n = auxiliary._parse_screenings(
+                source_dir, path, config, batch_id, _screening_type(path) or "", bundle)
+            coverage.parsed_files += 1
+            coverage.parsed_rows["screenings"] = coverage.parsed_rows.get("screenings", 0) + n
+        for path in health_files:
+            n = auxiliary._parse_health_mgmt(source_dir, path, config, batch_id, bundle)
+            coverage.parsed_files += 1
+            coverage.parsed_rows["lab_results"] = coverage.parsed_rows.get("lab_results", 0) + n
+
+        # 5. 跳過
+        parsed_paths = set(
+            roster_files + count_files + select_csvs + exclude_csvs
+            + p4p_case_files + p4p_track_files + screening_files + health_files
+        )
         for p in files:
             if p not in parsed_paths:
-                coverage.skipped_files[str(p.relative_to(source_dir))] = (
-                    "tiaohe v1 尚未實作此來源類型（sm_* P4P/篩檢預留 v2）")
+                reason = (
+                    "與 R11440次數/ 內逐月檔重複，避免重複計算"
+                    if p.name == "R11440次數_轉檔OK.xlsx"
+                    else "tiaohe v1 尚未實作此來源類型"
+                )
+                coverage.skipped_files[str(p.relative_to(source_dir))] = reason
 
         if count_files and not bundle.monthly_claims:
             issues.append(ValidationIssue(
@@ -226,15 +297,22 @@ class TiaoheParser:
                     "費用次數來源檔已找到，但 0 筆可對應照護名單。"
                     "請確認照護名單與費用檔是否屬同一診所同一期別。"
                 )))
-        for dataset, cnt in coverage.unmatched_rows.items():
+        for dataset, cnt in coverage.unlinked_rows.items():
             if cnt:
+                if dataset == "monthly_claims":
+                    message = (
+                        f"費用次數檔有 {cnt} 筆身分證號不在照護名單"
+                        "（一般門診病患）；資料已保留，會員欄位暫時留空。"
+                    )
+                else:
+                    message = (
+                        f"自選／不選來源有 {cnt} 筆身分證號不在照護名單，"
+                        "資料已保留，會員欄位暫時留空。"
+                    )
                 issues.append(ValidationIssue(
                     severity="warning", dataset=dataset,
-                    code="unmatched_source_rows",
-                    message=(
-                        f"費用次數檔有 {cnt} 筆姓名＋生日無法比對照護名單"
-                        "（可能為非家醫計畫病患或姓名格式差異），已略過。"
-                    )))
+                    code="source_rows_not_linked_to_roster",
+                    message=message))
 
         return ParseResult(bundle=bundle, coverage=coverage, issues=issues)
 
@@ -291,12 +369,27 @@ class TiaoheParser:
             wb.close()
         return parsed
 
+    @staticmethod
+    def _dedupe_roster(bundle: DatasetBundle) -> int:
+        unique_members = {}
+        for member in bundle.members:
+            unique_members.setdefault(member.person_id, member)
+        removed = len(bundle.members) - len(unique_members)
+        bundle.members = list(unique_members.values())
+
+        unique_selections = {}
+        for selection in bundle.member_selections:
+            key = (selection.person_id, selection.selection_type)
+            unique_selections.setdefault(key, selection)
+        bundle.member_selections = list(unique_selections.values())
+        return removed
+
     # ── 次數 xlsx ─────────────────────────────────────────────────────────────
     def _parse_count_workbook(
         self,
         source_dir: Path, path: Path,
         config: ClinicConfig, batch_id: str,
-        existing_ids: set,
+        roster_ids: set,
         bundle: DatasetBundle,
     ) -> Tuple[int, int]:
         code = _month_code(path.stem) or _month_code(path.name)
@@ -306,7 +399,7 @@ class TiaoheParser:
         month    = int(code[3:])
 
         wb = load_workbook(path, read_only=True, data_only=True)
-        parsed = unmatched = 0
+        parsed = unlinked = 0
         try:
             for ws in wb.worksheets:
                 header_row = _find_header_row(ws, (ID_HEADERS, ("次數", "件數")))
@@ -327,9 +420,8 @@ class TiaoheParser:
                     pid = normalize_id(vals[id_col])
                     if not TW_ID_RE.fullmatch(pid):
                         continue
-                    if pid not in existing_ids:
-                        unmatched += 1
-                        continue
+                    if pid not in roster_ids:
+                        unlinked += 1
                     bundle.monthly_claims.append(MonthlyClaimRecord(
                         trace=_trace(config, batch_id, source_dir, path,
                                      ws.title, row_no, vals),
@@ -342,14 +434,14 @@ class TiaoheParser:
                     parsed += 1
         finally:
             wb.close()
-        return parsed, unmatched
+        return parsed, unlinked
 
     # ── 自選 / 不要 CSV ───────────────────────────────────────────────────────
     def _parse_selection_csv(
         self,
         source_dir: Path, path: Path,
         config: ClinicConfig, batch_id: str,
-        existing_ids: set,
+        roster_ids: set,
         bundle: DatasetBundle,
         selection_type: str,
     ) -> Tuple[int, int]:
@@ -369,16 +461,15 @@ class TiaoheParser:
         if id_col is None:
             return 0, 0
 
-        parsed = unmatched = 0
+        parsed = unlinked = 0
         for row_no, row in enumerate(rows[hdr_idx + 1:], start=hdr_idx + 2):
             if id_col >= len(row):
                 continue
             pid = normalize_id(row[id_col])
             if not TW_ID_RE.fullmatch(pid):
                 continue
-            if pid not in existing_ids:
-                unmatched += 1
-                continue
+            if pid not in roster_ids:
+                unlinked += 1
             bundle.member_selections.append(MemberSelectionRecord(
                 trace=SourceTrace(
                     clinic_code=config.clinic_code,
@@ -393,4 +484,4 @@ class TiaoheParser:
                 selection_type=selection_type,
             ))
             parsed += 1
-        return parsed, unmatched
+        return parsed, unlinked

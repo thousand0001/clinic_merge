@@ -27,7 +27,9 @@ from typing import Optional, Sequence
 
 from db_pipeline.config.models import ClinicConfig, load_clinic_config
 from db_pipeline.parsers import PARSER_REGISTRY, get_parser
+from db_pipeline.raw import collect_raw_sources
 from db_pipeline.storage import PostgresStagingWriter
+from db_pipeline.validation.models import ValidationIssue
 from db_pipeline.validation.validator import validate_bundle
 
 TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
@@ -85,6 +87,7 @@ def _show_result(summary: dict, dry_run: bool) -> None:
         mode = "【試跑模式，未寫入 DB】" if dry_run else "【已寫入 staging】"
         counts = summary.get("dataset_counts", {})
         issues = summary.get("validation", {}).get("issues", [])
+        skipped = summary.get("coverage", {}).get("skipped_files", {})
         errors   = [i for i in issues if i["severity"] == "error"]
         warnings = [i for i in issues if i["severity"] == "warning"]
         total_errors   = summary.get("validation", {}).get("error_count", len(errors))
@@ -99,7 +102,10 @@ def _show_result(summary: dict, dry_run: bool) -> None:
             "── 解析結果 ──",
             f"  發現檔案：{summary['coverage']['discovered_files']}",
             f"  成功解析：{summary['coverage']['parsed_files']}",
-            f"  跳過檔案：{len(summary['coverage']['skipped_files'])}",
+            (
+                "  僅進 raw、未進結構化統計："
+                f"{len(summary['coverage']['skipped_files'])}"
+            ),
             "",
             "── 資料筆數 ──",
         ] + [f"  {k}: {v}" for k, v in counts.items() if v > 0] + [
@@ -109,6 +115,15 @@ def _show_result(summary: dict, dry_run: bool) -> None:
         ]
         if errors:
             lines += [""] + [f"  ❌ {e['message']}" for e in errors[:5]]
+        if warnings:
+            lines += ["", "── 警告內容 ──"]
+            lines += [f"  ⚠️ {item['message']}" for item in warnings[:10]]
+        if skipped:
+            lines += ["", "── 僅進 raw、未進結構化統計 ──"]
+            lines += [
+                f"  • {name}：{reason}"
+                for name, reason in list(skipped.items())[:15]
+            ]
 
         root = tk.Tk()
         root.withdraw()
@@ -129,13 +144,28 @@ def run(
     dry_run: bool = False,
     output: Optional[Path] = None,
 ) -> dict:
-    print(f"[1/4] 解析 {source_dir.name}（{config.source_system}）…")
+    print(f"[1/5] 保存原始來源列索引…")
+    raw_result = collect_raw_sources(source_dir)
+
+    print(f"[2/5] 解析 {source_dir.name}（{config.source_system}）…")
     parser = get_parser(config.source_system)
     parse_result = parser.parse(source_dir, config, batch_id)
+    parse_result.bundle.raw_source_files = raw_result.source_files
+    parse_result.bundle.raw_source_rows = raw_result.rows
+    raw_issues = [
+        ValidationIssue(
+            severity="warning",
+            dataset="raw_source_rows",
+            code="raw_rows_not_expanded",
+            message=f"{file_name}：{reason}",
+            source_file=file_name,
+        )
+        for file_name, reason in raw_result.unreadable_files.items()
+    ]
 
-    print(f"[2/4] 驗證資料…")
+    print(f"[3/5] 驗證資料…")
     validation = validate_bundle(parse_result.bundle)
-    all_issues = parse_result.issues + validation.issues
+    all_issues = parse_result.issues + raw_issues + validation.issues
     is_valid = not any(i.severity == "error" for i in all_issues)
 
     counts = parse_result.bundle.counts()
@@ -153,6 +183,8 @@ def run(
             "skipped_files":    parse_result.coverage.skipped_files,
             "parsed_rows":      parse_result.coverage.parsed_rows,
             "unmatched_rows":   parse_result.coverage.unmatched_rows,
+            "unlinked_rows":    parse_result.coverage.unlinked_rows,
+            "raw_unreadable_files": raw_result.unreadable_files,
         },
         "validation": {
             "is_valid":      is_valid,
@@ -175,7 +207,7 @@ def run(
     }
 
     if not dry_run and is_valid:
-        print(f"[3/4] 寫入 staging…")
+        print(f"[4/5] 寫入 raw 與 staging…")
         writer = PostgresStagingWriter()
         clinic_id = writer.get_clinic_id(config.clinic_code)
         stage_result = writer.stage(
@@ -189,13 +221,13 @@ def run(
         )
         summary["staged"] = True
         summary["staged_counts"] = stage_result.staged_counts
-        print(f"[4/4] 完成！batch_id={batch_id}")
+        print(f"[5/5] 完成！batch_id={batch_id}")
     elif dry_run:
-        print(f"[3/4] 試跑模式，跳過寫入。")
-        print(f"[4/4] 完成！")
+        print(f"[4/5] 試跑模式，跳過寫入。")
+        print(f"[5/5] 完成！")
     else:
-        print(f"[3/4] 驗證失敗，跳過寫入。")
-        print(f"[4/4] 完成（未寫入）。")
+        print(f"[4/5] 驗證失敗，跳過寫入。")
+        print(f"[5/5] 完成（未寫入）。")
 
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)

@@ -3,14 +3,14 @@
 解析器只產生 DatasetBundle，不直接寫資料庫或 Excel。
 """
 
-from .contracts     import ParseCoverage, ParseResult, SourceParser
-from .sm            import SmParser
-from .new_sm        import NewSmParser
-from .prospect      import ProspectParser
-from .medical_saint import MedicalSaintParser
-from .tiaohe        import TiaoheParser
-from .hongcheng     import HongchengParser
-from .custom        import CustomParser
+from .解析器介面 import ParseCoverage, ParseResult, SourceParser
+from .耀聖 import SmParser
+from .新耀聖 import NewSmParser
+from .展望 import ProspectParser
+from .醫聖 import MedicalSaintParser
+from .調和 import TiaoheParser
+from .宏誠 import HongchengParser
+from .自行系統 import CustomParser
 
 # source_system → parser 實例的對照表
 PARSER_REGISTRY: dict = {

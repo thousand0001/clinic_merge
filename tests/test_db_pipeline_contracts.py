@@ -10,7 +10,7 @@ from openpyxl import Workbook
 from db_pipeline.config.models import load_clinic_config
 from db_pipeline.datasets.models import DatasetBundle, MonthlyClaimRecord, SourceTrace
 from db_pipeline.detection.detector import detect_source_system
-from db_pipeline.parsers.sm import SmParser
+from db_pipeline.parsers.耀聖 import SmParser
 from db_pipeline.validation.validator import validate_bundle
 
 

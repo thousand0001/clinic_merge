@@ -16,6 +16,7 @@ class ParseCoverage:
     skipped_files: Dict[str, str] = field(default_factory=dict)
     parsed_rows: Dict[str, int] = field(default_factory=dict)
     unmatched_rows: Dict[str, int] = field(default_factory=dict)
+    unlinked_rows: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -35,4 +36,3 @@ class SourceParser(Protocol):
         batch_id: str,
     ) -> ParseResult:
         ...
-

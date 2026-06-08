@@ -1,0 +1,10 @@
+{
+  "clinic_code": "3501103076",
+  "clinic_name": "德容聯合診所",
+  "source_system": "hongcheng",
+  "detection": {},
+  "encodings": ["utf-8-sig", "utf-16", "cp950", "big5"],
+  "sheet_aliases": {},
+  "column_aliases": {},
+  "options": {}
+}

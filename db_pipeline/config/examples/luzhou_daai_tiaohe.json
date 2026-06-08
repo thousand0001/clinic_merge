@@ -1,0 +1,10 @@
+{
+  "clinic_code": "3531142830",
+  "clinic_name": "蘆洲大愛診所",
+  "source_system": "tiaohe",
+  "detection": {},
+  "encodings": ["utf-8-sig", "utf-16", "cp950", "big5"],
+  "sheet_aliases": {},
+  "column_aliases": {},
+  "options": {}
+}

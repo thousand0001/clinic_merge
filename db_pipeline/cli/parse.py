@@ -40,6 +40,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "skipped_files": result.coverage.skipped_files,
             "parsed_rows": result.coverage.parsed_rows,
             "unmatched_rows": result.coverage.unmatched_rows,
+            "unlinked_rows": result.coverage.unlinked_rows,
         },
         "validation": {
             "is_valid": is_valid,

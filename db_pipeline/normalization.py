@@ -64,7 +64,10 @@ def parse_date(value: Any) -> Optional[dt.date]:
     year = month = day = None
     parts = [part for part in re.split(r"[./-]", text) if part]
     if len(parts) == 3:
-        year, month, day = (int(part) for part in parts)
+        try:
+            year, month, day = (int(part) for part in parts)
+        except ValueError:
+            return None
     elif len(digits) == 7:
         year, month, day = int(digits[:3]), int(digits[3:5]), int(digits[5:7])
     elif len(digits) == 8:

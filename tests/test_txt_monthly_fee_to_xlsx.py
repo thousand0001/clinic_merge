@@ -5,7 +5,7 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from tools.醫聖月次數費用txt轉檔V1 import build_workbook, parse_txt_bytes
+from tools.醫聖月次數費用txt轉檔V2 import build_workbook, parse_txt_bytes
 
 
 ROOT = Path(__file__).resolve().parents[1]

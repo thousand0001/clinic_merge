@@ -37,3 +37,14 @@ staging、current、history 與 rollback。
 JSON/YAML 可設定系統類型、編碼、工作表別名、欄位別名及少量開關。
 複雜清洗與計算規則保留在可測試的 Python 程式。
 
+## D006：所有來源先進 raw，非會員仍進 staging
+
+狀態：採用。
+
+- 每個來源檔都登錄於 `meta.source_files`。
+- 每個可讀的非空來源列都寫入 `raw.uploaded_rows`。
+- 是否存在照護名單只影響會員欄位是否可補齊，不影響費用、名單旗標、
+  P4P、篩檢或檢驗資料是否進 staging。
+- 非會員資料保留真實身分證號；沒有來源的姓名、生日、電話等欄位留空。
+- 重複彙總檔保留於 raw，但不重複進入結構化統計。
+- 遷移驗證期間不更新 `raw.current_uploaded_rows`，避免影響既有正式流程。

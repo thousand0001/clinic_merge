@@ -4,21 +4,28 @@
 
 資料夾特徵：
 - 費用/ 子資料夾：逐月就診全明細 xlsx（每列=一次就診，含身份證號/看診日期/申請金額）
-- 次數/ 子資料夾：逐月就診次數 PDF（v1 僅記錄，不解析；待 v2 補上 pypdf）
+- 次數/ 子資料夾：逐月就診次數 PDF
 - 照護名單 / 指定名單 xlsx 或 csv
-- 各類篩檢獨立 xlsx
+- P4P、各類篩檢及個案健康管理 xlsx
 
 費用 xlsx 處理：
 - 按 身份證號 + 月份 聚合：次數=該月出現列數，金額=申請金額加總
+- PDF 依病歷號提供的月次數優先覆蓋明細列數
 - 最後就診日取該月最大看診日期
 """
 from __future__ import annotations
 
+import csv
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from openpyxl import load_workbook
+
+try:
+    from pypdf import PdfReader
+except ImportError:  # pragma: no cover
+    PdfReader = None
 
 from db_pipeline.config.models import ClinicConfig
 from db_pipeline.datasets.models import (
@@ -37,7 +44,8 @@ from db_pipeline.normalization import (
     parse_decimal,
     stable_row_hash,
 )
-from db_pipeline.parsers.contracts import ParseCoverage, ParseResult
+from db_pipeline.parsers.解析器介面 import ParseCoverage, ParseResult
+from db_pipeline.parsers.新耀聖 import NewSmParser
 from db_pipeline.validation.models import ValidationIssue
 
 # ── 常數 ──────────────────────────────────────────────────────────────────────
@@ -60,6 +68,15 @@ MEMBER_FIELDS = {
 MONTH_CODE_RE = re.compile(r"(?<!\d)(1(?:14|15)(?:0[1-9]|1[0-2]))(?!\d)")
 TW_ID_RE      = re.compile(r"[A-Z][12]\d{8}")
 XLSX_SUFFIXES = {".xlsx", ".xlsm"}
+SCREENING_FILENAME_MAP = {
+    "65歲以上老人": "老人流感",
+    "老人流感": "老人流感",
+    "bc型肝炎": "肝炎篩檢",
+    "b型肝炎": "肝炎篩檢",
+    "子宮頸": "子宮抹片",
+    "成人預防保健": "成人健檢",
+    "糞便潛血": "糞便潛血",
+}
 
 
 # ── 工具函式 ──────────────────────────────────────────────────────────────────
@@ -88,6 +105,26 @@ def _month_code(text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _parse_pdf_count_line(raw_line: str) -> Optional[Tuple[str, str, int]]:
+    parts = normalize_text(raw_line).split()
+    if len(parts) < 4 or not parts[0].isdigit():
+        return None
+    if not parts[-2].isdigit() or not parts[-1].isdigit():
+        return None
+    name = normalize_name("".join(parts[1:-2]))
+    if not name:
+        return None
+    return parts[0].lstrip("0") or "0", name, int(parts[-2])
+
+
+def _screening_type(path: Path) -> Optional[str]:
+    lower = path.stem.lower()
+    for keyword, value in SCREENING_FILENAME_MAP.items():
+        if keyword.lower() in lower:
+            return value
+    return None
+
+
 def _trace(
     config: ClinicConfig, batch_id: str, source_dir: Path,
     file_path: Path, sheet_name: str, row_no: int, values: Sequence[Any],
@@ -114,6 +151,7 @@ class HongchengParser:
         bundle   = DatasetBundle()
         coverage = ParseCoverage()
         issues: List[ValidationIssue] = []
+        auxiliary = NewSmParser()
 
         files = sorted(
             p for p in source_dir.rglob("*")
@@ -124,18 +162,35 @@ class HongchengParser:
         # 1. 照護名單
         roster_files = [
             p for p in files
-            if p.suffix.lower() in XLSX_SUFFIXES
+            if p.suffix.lower() in XLSX_SUFFIXES | {".csv"}
             and any(kw in p.name for kw in ("照護名單", "指定名單", "家醫名單"))
         ]
         for path in roster_files:
-            n = self._parse_member_workbook(source_dir, path, config, batch_id, bundle)
+            if path.suffix.lower() == ".csv":
+                n = self._parse_member_csv(source_dir, path, config, batch_id, bundle)
+            else:
+                n = self._parse_member_workbook(source_dir, path, config, batch_id, bundle)
             if n:
                 coverage.parsed_files += 1
                 coverage.parsed_rows["members"] = coverage.parsed_rows.get("members", 0) + n
 
         existing_ids = {m.person_id for m in bundle.members}
 
-        # 2. 費用/ xlsx → monthly_claims（聚合）
+        # 2. 次數 PDF 與費用 xlsx → monthly_claims（聚合）
+        pdf_dir = source_dir / "次數"
+        pdf_files = sorted(pdf_dir.glob("*.pdf")) if pdf_dir.is_dir() else []
+        pdf_counts: Dict[str, Dict[str, Tuple[int, str, Path, int, str]]] = {}
+        for path in pdf_files:
+            code = _month_code(path.stem)
+            if code is None:
+                continue
+            rows = self._parse_pdf_counts(path)
+            pdf_counts[code] = rows
+            coverage.parsed_files += 1
+            coverage.parsed_rows["monthly_visit_counts"] = (
+                coverage.parsed_rows.get("monthly_visit_counts", 0) + len(rows)
+            )
+
         fee_dir = source_dir / "費用"
         fee_files: List[Path] = []
         if fee_dir.is_dir():
@@ -145,25 +200,25 @@ class HongchengParser:
                 and _month_code(p.stem) is not None
             )
         for path in fee_files:
-            parsed, unmatched = self._parse_fee_workbook(
-                source_dir, path, config, batch_id, existing_ids, bundle)
+            parsed, unmatched, fee_fallback, count_differences = self._parse_fee_workbook(
+                source_dir, path, config, batch_id, existing_ids,
+                pdf_counts.get(_month_code(path.stem) or "", {}), bundle)
             if parsed or unmatched:
                 coverage.parsed_files += 1
                 coverage.parsed_rows["monthly_claims"] = (
                     coverage.parsed_rows.get("monthly_claims", 0) + parsed)
                 coverage.unmatched_rows["monthly_claims"] = (
                     coverage.unmatched_rows.get("monthly_claims", 0) + unmatched)
+                coverage.unlinked_rows["monthly_visit_counts"] = (
+                    coverage.unlinked_rows.get("monthly_visit_counts", 0)
+                    + fee_fallback
+                )
+                coverage.unlinked_rows["visit_count_differences"] = (
+                    coverage.unlinked_rows.get("visit_count_differences", 0)
+                    + count_differences
+                )
 
-        # 3. 次數/ PDF → 記錄為 skipped（v2 補上）
-        pdf_dir = source_dir / "次數"
-        pdf_files: List[Path] = []
-        if pdf_dir.is_dir():
-            pdf_files = list(pdf_dir.glob("*.pdf"))
-        for p in pdf_files:
-            coverage.skipped_files[str(p.relative_to(source_dir))] = (
-                "PDF 次數解析預留 v2（需 pypdf）")
-
-        # 4. 自選 / 不要 xlsx
+        # 3. 自選 / 不要 xlsx
         select_files = [
             p for p in files
             if p.suffix.lower() in XLSX_SUFFIXES
@@ -189,10 +244,56 @@ class HongchengParser:
             if n or u:
                 coverage.parsed_files += 1
 
+        # 4. P4P、篩檢、個案健康管理
+        p4p_case_files = [
+            p for p in files if p.suffix.lower() in XLSX_SUFFIXES
+            and re.search(r"P4P.*收案|P4p.*收案", p.name)
+        ]
+        p4p_track_files = [
+            p for p in files if p.suffix.lower() in XLSX_SUFFIXES
+            and re.search(r"P4P.*追蹤|P4p.*追蹤", p.name)
+        ]
+        screening_files = [
+            p for p in files if p.suffix.lower() in XLSX_SUFFIXES
+            and _screening_type(p) is not None
+        ]
+        health_files = [
+            p for p in files if p.suffix.lower() in XLSX_SUFFIXES
+            and "個案健康管理" in p.name
+        ]
+        for path in p4p_case_files:
+            n = auxiliary._parse_p4p_cases(
+                source_dir, path, config, batch_id, bundle)
+            coverage.parsed_files += 1
+            coverage.parsed_rows["p4p_cases"] = (
+                coverage.parsed_rows.get("p4p_cases", 0) + n)
+        for path in p4p_track_files:
+            n = auxiliary._parse_p4p_tracks(
+                source_dir, path, config, batch_id, bundle)
+            coverage.parsed_files += 1
+            coverage.parsed_rows["p4p_tracks"] = (
+                coverage.parsed_rows.get("p4p_tracks", 0) + n)
+        for path in screening_files:
+            n = auxiliary._parse_screenings(
+                source_dir, path, config, batch_id,
+                _screening_type(path) or "", bundle)
+            coverage.parsed_files += 1
+            coverage.parsed_rows["screenings"] = (
+                coverage.parsed_rows.get("screenings", 0) + n)
+        for path in health_files:
+            n = auxiliary._parse_health_mgmt(
+                source_dir, path, config, batch_id, bundle)
+            coverage.parsed_files += 1
+            coverage.parsed_rows["lab_results"] = (
+                coverage.parsed_rows.get("lab_results", 0) + n)
+
         # 5. 跳過
-        parsed_paths = set(roster_files + fee_files + select_files + exclude_files)
+        parsed_paths: Set[Path] = set(
+            roster_files + fee_files + pdf_files + select_files + exclude_files
+            + p4p_case_files + p4p_track_files + screening_files + health_files
+        )
         for p in files:
-            if p not in parsed_paths and p not in pdf_files:
+            if p not in parsed_paths:
                 coverage.skipped_files[str(p.relative_to(source_dir))] = (
                     "hongcheng v1 尚未實作此來源類型")
 
@@ -204,25 +305,120 @@ class HongchengParser:
                     "費用來源檔已找到，但 0 筆可對應照護名單。"
                     "請確認照護名單與費用檔是否屬同一診所同一期別。"
                 )))
-        if pdf_files:
+        if pdf_files and PdfReader is None:
             issues.append(ValidationIssue(
-                severity="warning", dataset="monthly_claims",
-                code="pdf_claims_skipped",
-                message=(
-                    f"有 {len(pdf_files)} 個次數 PDF 尚未解析，這部分費用次數暫缺"
-                    "（功能將於 v2 版補上）。"
-                )))
+                severity="error", dataset="monthly_claims",
+                code="missing_pypdf",
+                message="缺少 pypdf，無法解析宏誠就診次數 PDF。"))
         for dataset, cnt in coverage.unmatched_rows.items():
             if cnt:
                 issues.append(ValidationIssue(
                     severity="warning", dataset=dataset,
                     code="unmatched_source_rows",
                     message=(
-                        f"費用次數檔有 {cnt} 筆姓名＋生日無法比對照護名單"
-                        "（可能為非家醫計畫病患或姓名格式差異），已略過。"
+                        f"費用次數檔有 {cnt} 筆身分證號不在照護名單"
+                        "（一般門診病患），已以真實身分證號寫入。"
                     )))
+        fee_fallback = coverage.unlinked_rows.get("monthly_visit_counts", 0)
+        if fee_fallback:
+            issues.append(ValidationIssue(
+                severity="warning", dataset="monthly_claims",
+                code="pdf_count_missing",
+                message=(
+                    f"有 {fee_fallback} 個費用檔病歷號未出現在同月次數 PDF，"
+                    "已使用費用明細列數作為就診次數。"
+                )))
+        count_differences = coverage.unlinked_rows.get(
+            "visit_count_differences", 0)
+        if count_differences:
+            issues.append(ValidationIssue(
+                severity="warning", dataset="monthly_claims",
+                code="pdf_fee_count_difference",
+                message=(
+                    f"有 {count_differences} 個病歷號的 PDF 次數與費用明細列數不同，"
+                    "依宏誠來源規則採用 PDF 次數。"
+                )))
 
         return ParseResult(bundle=bundle, coverage=coverage, issues=issues)
+
+    def _parse_member_csv(
+        self,
+        source_dir: Path, path: Path,
+        config: ClinicConfig, batch_id: str,
+        bundle: DatasetBundle,
+    ) -> int:
+        text = ""
+        for encoding in config.encodings:
+            try:
+                text = path.read_text(encoding=encoding)
+                break
+            except UnicodeError:
+                continue
+        if not text:
+            return 0
+
+        rows = list(csv.reader(text.splitlines()))
+        if not rows:
+            return 0
+        headers = _header_map(rows[0])
+        id_col = _find_col(headers, ID_HEADERS)
+        if id_col is None:
+            return 0
+        field_cols = {
+            field_name: _find_col(headers, aliases)
+            for field_name, aliases in MEMBER_FIELDS.items()
+        }
+        birth_col = _find_col(headers, ("生日", "出生日期"))
+        seen: Set[str] = set()
+        parsed = 0
+        for row_no, values in enumerate(rows[1:], start=2):
+            if id_col >= len(values):
+                continue
+            person_id = normalize_id(values[id_col])
+            if not TW_ID_RE.fullmatch(person_id) or person_id in seen:
+                continue
+            seen.add(person_id)
+            kwargs = {
+                field_name: normalize_text(values[col]).lstrip("'")
+                if col is not None and col < len(values) else ""
+                for field_name, col in field_cols.items()
+            }
+            trace = _trace(
+                config, batch_id, source_dir, path, "CSV", row_no, values)
+            bundle.members.append(MemberRecord(
+                trace=trace,
+                person_id=person_id,
+                birth_date=(
+                    parse_date(values[birth_col])
+                    if birth_col is not None and birth_col < len(values)
+                    else None
+                ),
+                **kwargs,
+            ))
+            bundle.member_selections.append(MemberSelectionRecord(
+                trace=trace, person_id=person_id,
+                selection_type="designated_114"))
+            parsed += 1
+        return parsed
+
+    @staticmethod
+    def _parse_pdf_counts(
+        path: Path,
+    ) -> Dict[str, Tuple[int, str, Path, int, str]]:
+        if PdfReader is None:
+            return {}
+        rows: Dict[str, Tuple[int, str, Path, int, str]] = {}
+        reader = PdfReader(str(path))
+        source_row = 0
+        for page in reader.pages:
+            for raw_line in (page.extract_text() or "").splitlines():
+                source_row += 1
+                parsed = _parse_pdf_count_line(raw_line)
+                if parsed is None:
+                    continue
+                chart_no, name, count = parsed
+                rows[chart_no] = (count, name, path, source_row, raw_line)
+        return rows
 
     # ── 照護名單 ──────────────────────────────────────────────────────────────
     def _parse_member_workbook(
@@ -283,28 +479,30 @@ class HongchengParser:
         source_dir: Path, path: Path,
         config: ClinicConfig, batch_id: str,
         existing_ids: set,
+        pdf_counts: Dict[str, Tuple[int, str, Path, int, str]],
         bundle: DatasetBundle,
-    ) -> Tuple[int, int]:
+    ) -> Tuple[int, int, int, int]:
         code = _month_code(path.stem) or _month_code(path.name)
         if code is None:
-            return 0, 0
+            return 0, 0, 0, 0
         roc_year = int(code[:3])
         month    = int(code[3:])
 
         wb = load_workbook(path, read_only=True, data_only=True)
-        parsed = unmatched = 0
+        parsed = unmatched = fee_fallback = count_differences = 0
         try:
             ws = wb.worksheets[0]
             header_row = _find_header_row(ws, (ID_HEADERS, ("申請金額", "看診日期")))
             if header_row is None:
-                return 0, 0
+                return 0, 0, 0, 0
             hvals = [ws.cell(header_row, c).value for c in range(1, ws.max_column + 1)]
             hmap      = _header_map(hvals)
             id_col    = _find_col(hmap, ID_HEADERS)
             amount_col = _find_col(hmap, ("申請金額", "總額", "費用"))
             date_col   = _find_col(hmap, ("看診日期", "日期", "就醫日期"))
+            chart_col  = _find_col(hmap, ("病歷號", "病歷號碼"))
             if id_col is None:
-                return 0, 0
+                return 0, 0, 0, 0
 
             # 按 pid 聚合
             agg: Dict[str, dict] = {}
@@ -312,11 +510,16 @@ class HongchengParser:
                 pid = normalize_id(vals[id_col])
                 if not TW_ID_RE.fullmatch(pid):
                     continue
+                chart_no = ""
+                if chart_col is not None:
+                    chart_no = normalize_text(vals[chart_col]).split(".")[0]
+                    chart_no = chart_no.lstrip("0") or "0"
                 amt   = parse_decimal(vals[amount_col]) if amount_col is not None else parse_decimal(0)
                 vdate = parse_date(vals[date_col]) if date_col is not None else None
                 if pid not in agg:
                     agg[pid] = {"count": 0, "amount": parse_decimal(0),
-                                "last_visit": None, "first_row": None, "first_vals": None}
+                                "last_visit": None, "first_row": None,
+                                "first_vals": None, "chart_no": chart_no}
                 rec = agg[pid]
                 rec["count"] += 1
                 rec["amount"] += amt
@@ -329,21 +532,43 @@ class HongchengParser:
             for row_no, (pid, rec) in enumerate(agg.items(), start=header_row + 1):
                 if pid not in existing_ids:
                     unmatched += 1
-                    continue
+                pdf_row = pdf_counts.get(rec["chart_no"])
+                visit_count = pdf_row[0] if pdf_row is not None else rec["count"]
+                if pdf_row is None:
+                    fee_fallback += 1
+                elif pdf_row[0] != rec["count"]:
+                    count_differences += 1
+                trace = _trace(
+                    config, batch_id, source_dir, path,
+                    ws.title, row_no, rec["first_vals"] or [pid])
+                if pdf_row is not None:
+                    _, _, pdf_path, pdf_row_no, raw_line = pdf_row
+                    trace = SourceTrace(
+                        clinic_code=config.clinic_code,
+                        batch_id=batch_id,
+                        source_system=config.source_system,
+                        source_file=(
+                            f"{path.relative_to(source_dir)} + "
+                            f"{pdf_path.relative_to(source_dir)}"
+                        ),
+                        source_sheet=ws.title,
+                        source_row=pdf_row_no,
+                        raw_row_hash=stable_row_hash(
+                            list(rec["first_vals"] or [pid]) + [raw_line]),
+                    )
                 bundle.monthly_claims.append(MonthlyClaimRecord(
-                    trace=_trace(config, batch_id, source_dir, path,
-                                 ws.title, row_no, rec["first_vals"] or [pid]),
+                    trace=trace,
                     person_id=pid,
                     roc_year=roc_year,
                     month=month,
-                    visit_count=parse_decimal(rec["count"]),
+                    visit_count=parse_decimal(visit_count),
                     amount=rec["amount"],
                     last_visit_date=rec["last_visit"],
                 ))
                 parsed += 1
         finally:
             wb.close()
-        return parsed, unmatched
+        return parsed, unmatched, fee_fallback, count_differences
 
     # ── 自選 / 不要 ──────────────────────────────────────────────────────────
     def _parse_selection_workbook(

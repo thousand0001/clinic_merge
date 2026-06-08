@@ -67,6 +67,71 @@ def split_dx_fields(fields: list[str]) -> tuple[list[str], list[str]]:
     return cleaned[:half], cleaned[half:]
 
 
+def looks_like_old_standard_comma_format(lines: list[str]) -> bool:
+    """舊格式：病歷號, 看診日, 姓名, ..., 身分證, 生日, ..., ICD9×n, ICD10×n, 天數, ..., 申請額, 最後就診日"""
+    if len(lines) < 2:
+        return False
+    header = lines[1]
+    return "ICD10" in header and "最後就診日" in header and "看診日" in header and "生日" in header
+
+
+def parse_old_standard_comma_records(lines: list[str]) -> list[dict]:
+    """解析舊式欄位順序：0=病歷號 1=看診日 2=姓名 5=身分證 6=生日 8=住址 9=電話
+    末尾固定9欄：天數,掛號費,處置費,自付額,診察費,自費,藥費,申請額,最後就診日
+    ICD9/ICD10 佔中間變動欄位數"""
+    records: list[dict] = []
+    for line in lines[2:]:
+        parts = [p.strip() for p in line.split(",")]
+        while parts and not normalize(parts[-1]):
+            parts.pop()
+        # 至少 12 固定前置 + 9 固定後置 = 21 欄
+        if len(parts) < 21:
+            continue
+        id_idx = next((idx for idx, p in enumerate(parts) if looks_like_id_token(p)), None)
+        if id_idx != 5:
+            continue
+        chart_no = normalize(parts[0])
+        visit_date = normalize(parts[1])
+        name = normalize(parts[2])
+        id_no = normalize(parts[5])
+        bday = normalize(parts[6])
+        address = normalize(parts[8]) if len(parts) > 8 else ""
+        phone = normalize(parts[9]) if len(parts) > 9 else ""
+        # 末尾固定：[-9]=天數 [-2]=申請額 [-1]=最後就診日
+        last_visit_raw = normalize(parts[-1])
+        if not looks_like_date_token(last_visit_raw):
+            continue
+        last_visit = last_visit_raw.replace(".", "")
+        apply_amount = parse_int(parts[-2])
+        days = parse_int(parts[-9])
+        # ICD10 碼：12 固定前置之後、末尾 9 欄之前，取符合 ICD 格式者
+        mid_start = 12
+        mid_end = len(parts) - 9
+        icd10_codes = [
+            normalize(parts[i])
+            for i in range(mid_start, mid_end)
+            if re.fullmatch(r"[A-Z][0-9A-Z]{2,8}", normalize(parts[i]))
+               and not looks_like_id_token(normalize(parts[i]))
+        ]
+        if not chart_no or not id_no or not looks_like_date_token(visit_date):
+            continue
+        records.append({
+            "病歷號": chart_no,
+            "看診日": visit_date,
+            "姓名": name,
+            "身份證號": id_no,
+            "生日": bday,
+            "住址": address,
+            "電話": phone,
+            "天數": days,
+            "申請金額": apply_amount,
+            "最後就診日": last_visit,
+            "診斷代碼": ",".join(icd10_codes),
+            "件數": 1,
+        })
+    return records
+
+
 def parse_comma_records(lines: list[str]) -> list[dict]:
     records: list[dict] = []
     for line in lines[2:]:
@@ -241,7 +306,10 @@ def parse_txt_bytes(data: bytes, source_name: str) -> tuple[str, list[dict]]:
     title = normalize(lines[0])
     month = title.split(":", 1)[-1] if ":" in title else Path(source_name).stem.replace("-", "")
     month = month.strip()
-    records = parse_comma_records(lines)
+    if looks_like_old_standard_comma_format(lines):
+        records = parse_old_standard_comma_records(lines)
+    else:
+        records = parse_comma_records(lines)
     if not records:
         records = parse_fixed_width_records(lines)
     if not records and looks_like_multiline_comma_format(lines):

@@ -96,6 +96,26 @@ class MemberSelectionRecord:
     selection_type: str
 
 
+@dataclass(frozen=True)
+class RawSourceFile:
+    relative_path: str
+    file_name: str
+    file_size: int
+    sha256: str
+    file_mtime: dt.datetime
+    data_type: str
+
+
+@dataclass(frozen=True)
+class RawSourceRow:
+    source_file: str
+    file_name: str
+    sheet_name: str
+    row_no: int
+    row_data: Dict[str, object]
+    row_hash: str
+
+
 @dataclass
 class DatasetBundle:
     members: List[MemberRecord] = field(default_factory=list)
@@ -105,6 +125,8 @@ class DatasetBundle:
     lab_results: List[LabResultRecord] = field(default_factory=list)
     screenings: List[ScreeningRecord] = field(default_factory=list)
     member_selections: List[MemberSelectionRecord] = field(default_factory=list)
+    raw_source_files: List[RawSourceFile] = field(default_factory=list)
+    raw_source_rows: List[RawSourceRow] = field(default_factory=list)
 
     def counts(self) -> Dict[str, int]:
         return {
@@ -115,4 +137,6 @@ class DatasetBundle:
             "lab_results": len(self.lab_results),
             "screenings": len(self.screenings),
             "member_selections": len(self.member_selections),
+            "raw_source_files": len(self.raw_source_files),
+            "raw_source_rows": len(self.raw_source_rows),
         }
