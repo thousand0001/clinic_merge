@@ -279,3 +279,36 @@
 1. 將 Provider 比對擴充到鈞安與蘆洲大愛，確認不同來源系統均可還原相同中間資料。
 2. 定義輸出層實際需要的查詢方法，避免 Excel 輸出層自行掃資料夾或拼 SQL。
 3. 完成第 6 階段後進入第 7 階段新舊 Excel 輸出比對。
+
+## 2026-06-09 第 7 階段 輸出比對基礎建設
+
+已建立：
+
+- `db_pipeline/output/member_builder.py`：
+  - `build_from_bundle(DatasetBundle) → Dict[str, Dict]`
+  - 等同舊流程 `build_members()`，來源改為 DatasetBundle。
+  - AW:BJ 欄位：中文 key 直接對應 `write_output()` 的 `designated_fields`。
+  - L/M/N/O 欄位：114_count_q1 / 115_count / 114_avg_amount / 115_avg_amount，計算邏輯與舊流程一致。
+  - 包含 disease_code 推算、merge_if_empty 保護、sex 補齊。
+- `db_pipeline/output/__init__.py`：package init。
+- `tools/generate_output.py`：
+  - CLI：`python tools/generate_output.py <batch_id> --template <範本> --dest <輸出>`
+  - 以 `PostgresDataProvider` 讀取 staging → `build_from_bundle` → 舊流程 `write_output()`。
+- `tools/compare_common_output.py`：醫生看工作表 max_col 由 48 擴至 62，涵蓋 AW:BJ。
+- `tests/test_member_builder.py`：9 項單元測試（AW:BJ、L/M/N/O、旗標、篩檢、檢驗、P4P、disease_code、merge），全部通過。
+- 全套 24 項測試通過，無 regression。
+
+注意：
+
+- disease_code ≠ None 時，ASCVD 欄位改寫為 "1"（與舊流程行為一致）。
+- 鈞安與蘆洲大愛目前無舊流程批次（raw.uploaded_rows 空）；實際 Excel 比對需先以舊流程跑相同來源資料夾。
+
+比對步驟（使用者執行）：
+
+1. 以舊流程產出舊 Excel：`python 資料庫輸出0601.py --source <來源資料夾> --dest old.xlsx`
+2. 以新工具產出新 Excel：`python tools/generate_output.py <batch_id> --template <範本> --dest new.xlsx`
+3. 比對：`python tools/compare_common_output.py old.xlsx new.xlsx`
+
+下一步：
+
+1. Phase 8：Operations & output UI（診所選擇、批次管理、一鍵產出）。

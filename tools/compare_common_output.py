@@ -114,7 +114,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     old_path = Path(args.old)
     new_path = Path(args.new)
     compare_sheet(old_path, new_path, "會員總表", 1, 3, 5, 50, args.count)
-    compare_sheet(old_path, new_path, "醫生看(從會員指標內容Key過來)", 1, 4, 1, 48, args.count)
+    # 欄位範圍延伸至 62（BJ），涵蓋 L/M/N/O（12-15）與 AW:BJ（49-62）
+    compare_sheet(old_path, new_path, "醫生看(從會員指標內容Key過來)", 1, 4, 1, 62, args.count)
     return 0
 
 
