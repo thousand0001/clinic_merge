@@ -163,6 +163,7 @@ def generate(
     clinic_addr  = parts[1] if len(parts) > 1 else ""
     clinic_phone = parts[2] if len(parts) > 2 else ""
 
+    dest_dir.mkdir(parents=True, exist_ok=True)
     branch = branch_from_address(clinic_addr) or 1
     month  = upload_month or datetime.date.today().strftime("%m")
     lookup = build_lookup(excel_path)
@@ -332,7 +333,7 @@ def _gui():
         return
 
     template = filedialog.askopenfilename(
-        title="選擇「指定會員模板」Excel（書田可略過，直接取消）",
+        title="選擇「指定會員模板」Excel（若無模板可直接取消）",
         filetypes=[("Excel","*.xlsx"), ("所有檔案","*.*")]
     )
 
