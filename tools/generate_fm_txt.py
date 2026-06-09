@@ -135,7 +135,8 @@ SELECT DISTINCT ON (m.patient_id_normalized)
     COALESCE(m.name, ''),
     COALESCE(to_char(m.birth_date, 'YYYYMMDD'), ''),
     COALESCE(NULLIF(m.phone, ''), NULLIF(m.mobile, ''), ''),
-    COALESCE(m.member_type::text, '')
+    COALESCE(m.member_type::text, ''),
+    COALESCE(m.address, '')
 FROM staging.members m
 JOIN meta.import_batches b ON b.batch_id = m.batch_id
 JOIN meta.clinics c ON c.clinic_id = b.clinic_id
@@ -154,6 +155,7 @@ ORDER BY m.patient_id_normalized, b.started_at DESC;
             "birthday":    parts[2],
             "tel":         parts[3],
             "member_type": parts[4],
+            "address":     parts[5] if len(parts) > 5 else "",
         }
     return lookup
 
@@ -283,6 +285,7 @@ def generate(
         birthday    = r["birthday"]    or m.get("birthday", "")
         name        = r["name"]        or m.get("name", "")
         tel         = r["tel"]         or m.get("tel", "") or clinic_phone
+        addr        = r.get("address", "") or m.get("address", "") or clinic_addr
         member_type = r["member_type"] or m.get("member_type", "")
         records.append(make_record(
             plan_no   = plan_no,
@@ -292,7 +295,7 @@ def generate(
             birthday  = birthday or "        ",
             name      = name,
             sex       = sex_from_id(pid),
-            addr      = clinic_addr,
+            addr      = addr,
             tel       = tel,
             prsn_id   = prsn_id,
             case_type = case_abc(member_type),
