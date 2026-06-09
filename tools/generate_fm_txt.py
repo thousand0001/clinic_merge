@@ -356,6 +356,8 @@ def _gui():
             confirm_overwrite = _ask_overwrite,
         )
         messagebox.showinfo("完成", "已產生：\n" + "\n".join(str(p) for p in out))
+        import subprocess
+        subprocess.Popen(["open", str(dest)])
     except Exception as e:
         messagebox.showerror("錯誤", str(e))
 
