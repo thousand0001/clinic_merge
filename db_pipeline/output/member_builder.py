@@ -17,9 +17,10 @@ from typing import Any, Dict, Optional
 
 from db_pipeline.datasets.models import DatasetBundle
 
-# ── 疾病樣態映射（與舊流程 disease_code_text 相同） ──────────────────────────
+# ── 疾病樣態映射（與舊流程 disease_code_text 完全一致） ─────────────────────
+# 舊流程: "1"=DM, "2"=CKD, "3"=DKD, "4"=None（非疾病，不在 map 中）
 _DISEASE_MAP = {
-    "1": "DM", "2": "HTN", "3": "CKD", "4": "DKD",
+    "1": "DM", "2": "CKD", "3": "DKD",
     "5": "HLP", "6": "ASCVD",
 }
 
@@ -30,16 +31,18 @@ def _disease_code_text(value: Any) -> str:
 
 
 def _disease_class_text(disease_code: str, ascvd_value: Any) -> str:
+    """與舊流程 disease_class_text() 一致（DM+ASCVD / CKD+ASCVD 複合標籤）。"""
     ascvd = str(ascvd_value).strip().lower() if ascvd_value else ""
-    if disease_code in {"DM", "DKD"}:
-        return "糖尿病"
+    has_ascvd = ascvd in {"1", "a", "b", "ascvd-a", "ascvd-b"}
+    if disease_code == "DM":
+        return "DM+ASCVD" if has_ascvd else "DM"
     if disease_code == "CKD":
-        return "慢性腎臟病"
-    if disease_code in {"HTN", "HLP"}:
-        return "高血壓/高血脂"
-    if ascvd and ascvd not in {"0", ""}:
+        return "CKD+ASCVD" if has_ascvd else "CKD"
+    if disease_code == "DKD":
+        return "DKD+ASCVD" if has_ascvd else "DKD"
+    if has_ascvd:
         return "ASCVD"
-    return ""
+    return "" if disease_code in {"", "None"} else disease_code
 
 
 def _norm(value: Any) -> str:
@@ -180,7 +183,7 @@ def build_from_bundle(bundle: DatasetBundle) -> Dict[str, Dict[str, Any]]:
         if keys:
             val_key, date_key = keys
             _merge_if_empty(m, {
-                val_key:  rec.result_value or None,
+                val_key:  _norm(rec.result_value) or None,
                 date_key: rec.tested_at,
             })
 

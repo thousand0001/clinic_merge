@@ -79,8 +79,8 @@ class TestAwBjFields(unittest.TestCase):
         self.assertEqual(m["非慢性病註記"], "0")
         self.assertEqual(m["與前一年家醫收案診所相同"], "1")
         self.assertEqual(m["疾病樣態"], "4")
-        # disease_pattern="4" → DKD ≠ None → ASCVD 改為 "1"（與舊流程行為相同）
-        self.assertEqual(m["ASCVD"], "1")
+        # disease_pattern="4" → "None"（非疾病）→ ASCVD 保留原始值 "b"
+        self.assertEqual(m["ASCVD"], "b")
         self.assertEqual(m["三高"], "1")
         self.assertEqual(m["高血壓"], "0")
         self.assertEqual(m["高血脂"], "1")
@@ -232,7 +232,8 @@ class TestDiseaseCode(unittest.TestCase):
         members = build_from_bundle(bundle)
         m = members["J123456789"]
         self.assertEqual(m["disease_code"], "DM")
-        self.assertEqual(m["disease_class"], "糖尿病")
+        # DM 且 disease_code != "None" → ASCVD 強制為 "1" → disease_class 帶 +ASCVD
+        self.assertEqual(m["disease_class"], "DM+ASCVD")
 
 
 class TestMerge(unittest.TestCase):
