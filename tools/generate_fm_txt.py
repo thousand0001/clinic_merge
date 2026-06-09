@@ -63,7 +63,14 @@ def to_yyyymmdd(v) -> str:
     if isinstance(v, (datetime.datetime, datetime.date)):
         return v.strftime("%Y%m%d")
     s = str(v).strip()
-    return s if (len(s) == 8 and s.isdigit()) else "        "
+    if len(s) == 8 and s.isdigit():
+        return s
+    # 支援 YYYY/MM/DD 或 YYYY-MM-DD
+    for sep in ("/", "-"):
+        parts = s.split(sep)
+        if len(parts) == 3 and all(p.isdigit() for p in parts):
+            return f"{parts[0]}{parts[1].zfill(2)}{parts[2].zfill(2)}"
+    return "        "
 
 
 def case_abc(v) -> str:
@@ -144,7 +151,7 @@ def generate(
     serial: str = "01",
     prsn_id: str = DEFAULT_PRSN_ID,
     upload_month: str | None = None,
-) -> Path:
+) -> list[Path]:
     # 從 DB 取診所資料
     r = _run_query(
         f"SELECT clinic_name, institution_address, institution_phone "
@@ -197,14 +204,23 @@ def generate(
             m = lookup.get(pid, {})
             records.append(_rec(pid, m.get("birthday", "        "), m.get("case_type", "A")))
 
-    fname = f"{branch}{hosp_id}{month}{serial}FM.txt"
-    out_path = dest_dir / fname
-    with open(out_path, "wb") as f:
-        for rec in records:
-            f.write(rec + b"\r\n")
+    # 超過 9999 自動拆檔（serial 遞增）
+    MAX_PER_FILE = 9999
+    chunks = [records[i:i+MAX_PER_FILE] for i in range(0, len(records), MAX_PER_FILE)]
+    out_paths = []
+    serial_int = int(serial)
+    for chunk in chunks:
+        sn = f"{serial_int:02d}"
+        fname = f"{branch}{hosp_id}{month}{sn}FM.txt"
+        out_path = dest_dir / fname
+        with open(out_path, "wb") as f:
+            for rec in chunk:
+                f.write(rec + b"\r\n")
+        print(f"✓ {fname}：{len(chunk)} 筆，業務組別={branch}")
+        out_paths.append(out_path)
+        serial_int += 1
 
-    print(f"✓ {fname}：{len(records)} 筆，業務組別={branch}")
-    return out_path
+    return out_paths
 
 
 # ── 診所搜尋 ──────────────────────────────────────────────────────────────────
@@ -333,7 +349,7 @@ def _gui():
             template_path = Path(template) if template else None,
             mode          = mode,
         )
-        messagebox.showinfo("完成", f"已產生：\n{out}")
+        messagebox.showinfo("完成", "已產生：\n" + "\n".join(str(p) for p in out))
     except Exception as e:
         messagebox.showerror("錯誤", str(e))
 
