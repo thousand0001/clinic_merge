@@ -13,12 +13,12 @@
         --dest    "輸出資料夾/" \\
         [--plan-no 01] [--serial 01] [--prsn-id A123456789]
 
-    # 書田（無指定會員模板，用自選名單 sheet）：
+    # 書田（有指定會員模板，超過 9999 筆自動拆檔）：
     python tools/generate_fm_txt.py \\
-        --hosp-id 4001020028 \\
-        --excel   "路徑/書田泌尿科眼科診所選會員_0609_1548.xlsx" \\
-        --mode    shuda \\
-        --dest    "輸出資料夾/"
+        --hosp-id  4001020028 \\
+        --template "路徑/尹書田診所-自行開發 115年指定會員名單模板.xlsx" \\
+        --excel    "路徑/書田泌尿科眼科診所選會員_0609_1548.xlsx" \\
+        --dest     "輸出資料夾/"
 
 GUI 模式（不帶任何參數直接執行）：
     python tools/generate_fm_txt.py
