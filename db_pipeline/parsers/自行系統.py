@@ -211,7 +211,55 @@ class CustomParser:
             if n or u:
                 coverage.parsed_files += 1
 
-        # 4. 跳過
+        # 4. name/phone/birth enrichment：掃所有 xlsx，有 ID+姓名欄就補回 bundle
+        name_lookup: dict = {}  # pid → (name, phone, mobile, birth_date)
+        for p in files:
+            if p.suffix.lower() not in XLSX_SUFFIXES:
+                continue
+            try:
+                wb2 = load_workbook(p, read_only=True, data_only=True)
+                for ws2 in wb2.worksheets:
+                    hr = _find_header_row(ws2, (ID_HEADERS, ("姓名",)))
+                    if hr is None:
+                        continue
+                    hv2 = [ws2.cell(hr, c).value for c in range(1, ws2.max_column + 1)]
+                    hm2 = _header_map(hv2)
+                    ic = _find_col(hm2, ID_HEADERS)
+                    nc = _find_col(hm2, ("姓名",))
+                    pc = _find_col(hm2, ("電話",))
+                    mc = _find_col(hm2, ("手機", "手機號碼"))
+                    bc = _find_col(hm2, ("生日", "出生日期", "BIRTHDAY"))
+                    if ic is None or nc is None:
+                        continue
+                    for row in ws2.iter_rows(min_row=hr + 1, values_only=True):
+                        pid = normalize_id(row[ic])
+                        if not TW_ID_RE.fullmatch(pid):
+                            continue
+                        name   = normalize_name(row[nc]) if nc is not None else ""
+                        phone  = normalize_phone(row[pc]) if pc is not None else ""
+                        mobile = normalize_phone(row[mc]) if mc is not None else ""
+                        bday   = parse_date(row[bc]) if bc is not None else None
+                        if name and pid not in name_lookup:
+                            name_lookup[pid] = (name, phone, mobile, bday)
+                wb2.close()
+            except Exception:
+                pass
+
+        # 把 lookup 補回 name/phone 空白的成員（frozen dataclass 需 replace）
+        import dataclasses
+        for i, m in enumerate(bundle.members):
+            if m.person_id not in name_lookup:
+                continue
+            n, ph, mo, bd = name_lookup[m.person_id]
+            updates = {}
+            if not m.name and n:           updates["name"]       = n
+            if not m.phone and ph:         updates["phone"]      = ph
+            if not m.mobile and mo:        updates["mobile"]     = mo
+            if m.birth_date is None and bd: updates["birth_date"] = bd
+            if updates:
+                bundle.members[i] = dataclasses.replace(m, **updates)
+
+        # 5. 跳過
         parsed_paths = set(
             roster_files + r11440_single + r11440_monthly + select_files + exclude_files)
         for p in files:
