@@ -160,6 +160,46 @@ ORDER BY m.patient_id_normalized, b.started_at DESC;
     return lookup
 
 
+# ── 選會員 Excel 補充查找（名字/電話） ────────────────────────────────────────────
+def _find_xuanhui_excel(input_path: Path, hosp_id: str) -> Path | None:
+    """在輸入檔同層或上一層找對應診所的 *選會員_*.xlsx。"""
+    # 從 DB 取診所名稱，用來比對檔名
+    clinic_name = _run_query(
+        f"SELECT clinic_name FROM meta.clinics WHERE clinic_code='{hosp_id}' LIMIT 1;"
+    ) or ""
+    for d in [input_path.parent, input_path.parent.parent]:
+        # 先找含診所名稱的
+        for f in sorted(d.glob("*選會員_*.xlsx")):
+            if clinic_name and clinic_name in f.name:
+                return f
+        # 找不到就取第一個
+        for f in sorted(d.glob("*選會員_*.xlsx")):
+            return f
+    return None
+
+
+def _build_xuanhui_lookup(excel_path: Path) -> dict:
+    """從選會員 Excel 的「醫生看」sheet 讀 pid→{name, tel}。"""
+    wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+    sheet_name = next((s for s in wb.sheetnames if "醫生看" in s), None)
+    if not sheet_name:
+        return {}
+    ws = wb[sheet_name]
+    lookup: dict = {}
+    for row in ws.iter_rows(min_row=4, values_only=True):
+        pid = str(row[0]).strip() if row[0] else None
+        if not pid or pid == "None":
+            continue
+        tel = str(row[4]).strip() if len(row) > 4 and row[4] else (
+              str(row[5]).strip() if len(row) > 5 and row[5] else "")
+        lookup[pid] = {
+            "name": str(row[1]).strip() if len(row) > 1 and row[1] else "",
+            "tel":  tel,
+        }
+    print(f"  選會員 Excel：{excel_path.name}（{len(lookup)} 筆）")
+    return lookup
+
+
 # ── Excel 讀取 ────────────────────────────────────────────────────────────────
 def _read_input(input_path: Path) -> tuple[str | None, list[dict]]:
     """
@@ -277,14 +317,19 @@ def generate(
     db = _build_db_lookup(hosp_id)
     print(f"  DB 會員筆數：{len(db)}")
 
-    # 組 records（檔案有的欄位優先，沒有再從 DB 補）
+    # 選會員 Excel 補充（自動偵測，用於名字/電話）
+    xh_path = _find_xuanhui_excel(input_path, hosp_id)
+    xh = _build_xuanhui_lookup(xh_path) if xh_path else {}
+
+    # 組 records（優先順序：輸入 Excel > DB > 選會員 Excel > 診所電話）
     records = []
     for r in rows:
         pid = r["pid"]
         m   = db.get(pid, {})
+        x   = xh.get(pid, {})
         birthday    = r["birthday"]    or m.get("birthday", "")
-        name        = r["name"]        or m.get("name", "")
-        tel         = r["tel"]         or m.get("tel", "") or clinic_phone
+        name        = r["name"]        or m.get("name", "") or x.get("name", "")
+        tel         = r["tel"]         or m.get("tel", "") or x.get("tel", "") or clinic_phone
         addr        = r.get("address", "") or m.get("address", "")
         member_type = r["member_type"] or m.get("member_type", "")
         records.append(make_record(
