@@ -88,3 +88,25 @@ def stable_row_hash(values: Iterable[Any]) -> str:
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+
+# NHI 分區業務組別代碼：1=臺北 2=北區 3=中區 4=南區 5=高屏 6=東區
+_BRANCH_PREFIXES: list[tuple[int, tuple[str, ...]]] = [
+    (1, ("臺北市", "台北市")),
+    (2, ("新北市", "基隆市", "宜蘭縣", "宜蘭市",
+         "桃園市", "桃園縣", "新竹市", "新竹縣", "苗栗縣")),
+    (3, ("臺中市", "台中市", "台中縣", "彰化縣", "南投縣")),
+    (4, ("嘉義市", "嘉義縣", "雲林縣", "臺南市", "台南市", "台南縣")),
+    (5, ("高雄市", "高雄縣", "屏東縣")),
+    (6, ("花蓮縣", "臺東縣", "台東縣", "澎湖縣", "金門縣", "連江縣")),
+]
+
+
+def branch_from_address(address: str) -> Optional[int]:
+    """由診所地址推算 NHI 分區業務組別代碼（1–6），無法判斷回傳 None。"""
+    if not address:
+        return None
+    for code, prefixes in _BRANCH_PREFIXES:
+        if any(address.startswith(p) for p in prefixes):
+            return code
+    return None
+

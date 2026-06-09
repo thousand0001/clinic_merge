@@ -1,0 +1,14 @@
+{
+  "clinic_code": "3501013059",
+  "clinic_name": "親親家庭診所",
+  "source_system": "medical_saint",
+  "detection": {},
+  "encodings": [
+    "utf-8-sig",
+    "cp950",
+    "big5"
+  ],
+  "sheet_aliases": {},
+  "column_aliases": {},
+  "options": {}
+}

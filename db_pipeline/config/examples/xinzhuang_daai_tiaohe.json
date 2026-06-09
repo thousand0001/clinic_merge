@@ -1,0 +1,15 @@
+{
+  "clinic_code": "3531064199",
+  "clinic_name": "新莊大愛眼科診所",
+  "source_system": "tiaohe",
+  "detection": {},
+  "encodings": [
+    "utf-8-sig",
+    "utf-16",
+    "cp950",
+    "big5"
+  ],
+  "sheet_aliases": {},
+  "column_aliases": {},
+  "options": {}
+}

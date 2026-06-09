@@ -30,8 +30,8 @@ class DetectionRule:
 @dataclass(frozen=True)
 class ClinicConfig:
     clinic_code: str
-    clinic_name: str
     source_system: str
+    clinic_name: str = ""          # 選填：空白時由 DB meta.clinics 自動補
     detection: DetectionRule = field(default_factory=DetectionRule)
     encodings: List[str] = field(
         default_factory=lambda: ["utf-8-sig", "utf-16", "cp950", "big5"]
@@ -43,8 +43,6 @@ class ClinicConfig:
     def validate(self) -> None:
         if not self.clinic_code:
             raise ValueError("clinic_code 不可為空")
-        if not self.clinic_name:
-            raise ValueError("clinic_name 不可為空")
         if self.source_system not in SUPPORTED_SOURCE_SYSTEMS:
             raise ValueError(
                 "不支援的 source_system："
@@ -52,9 +50,10 @@ class ClinicConfig:
             )
 
 
-def load_clinic_config(path: Path) -> ClinicConfig:
+def load_clinic_config(path: Path) -> "ClinicConfig":
     data = json.loads(path.read_text(encoding="utf-8"))
     detection_data = data.pop("detection", {})
+    data.setdefault("clinic_name", "")
     config = ClinicConfig(
         detection=DetectionRule(**detection_data),
         **data,

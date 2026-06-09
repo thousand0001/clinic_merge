@@ -210,6 +210,17 @@ def run(
         print(f"[4/5] 寫入 raw 與 staging…")
         writer = PostgresStagingWriter()
         clinic_id = writer.get_clinic_id(config.clinic_code)
+        # clinic_name 空白時從 DB 補
+        if not config.clinic_name:
+            from db_pipeline.storage import _run_query
+            db_name = _run_query(
+                f"SELECT clinic_name FROM meta.clinics "
+                f"WHERE clinic_code='{config.clinic_code}' LIMIT 1;"
+            )
+            if db_name:
+                import dataclasses
+                config = dataclasses.replace(config, clinic_name=db_name)
+            summary["clinic_name"] = config.clinic_name
         # 合併所有 issues 傳給 writer，讓驗證紀錄完整寫入 meta.validation_errors
         from db_pipeline.validation.models import ValidationReport
         full_report = ValidationReport(issues=all_issues, dataset_counts=counts)

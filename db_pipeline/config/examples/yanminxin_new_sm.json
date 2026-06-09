@@ -1,0 +1,13 @@
+{
+  "clinic_code": "3501175465",
+  "clinic_name": "嚴敏心耳鼻喉科診所",
+  "source_system": "new_sm",
+  "detection": {},
+  "encodings": [
+    "utf-8-sig",
+    "cp950"
+  ],
+  "sheet_aliases": {},
+  "column_aliases": {},
+  "options": {}
+}
