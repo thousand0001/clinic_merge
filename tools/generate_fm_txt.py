@@ -207,6 +207,50 @@ def generate(
     return out_path
 
 
+# ── 診所搜尋 ──────────────────────────────────────────────────────────────────
+def search_clinics(keyword: str) -> list[dict]:
+    """依診所名稱模糊搜尋，回傳 [{'code':..., 'name':...}, ...]"""
+    kw = keyword.strip().replace("'", "''")
+    r = _run_query(
+        f"SELECT clinic_code, clinic_name FROM meta.clinics "
+        f"WHERE clinic_name LIKE '%{kw}%' OR official_name LIKE '%{kw}%' "
+        f"ORDER BY clinic_name LIMIT 20;"
+    )
+    if not r:
+        return []
+    results = []
+    for line in r.splitlines():
+        parts = line.split("|")
+        if len(parts) >= 2:
+            results.append({"code": parts[0], "name": parts[1]})
+    return results
+
+
+def resolve_hosp_id(hosp_id: str | None, hosp_name: str | None) -> str:
+    """從代碼或名稱解析出唯一的 clinic_code，多筆時 CLI 互動選擇。"""
+    if hosp_id:
+        return hosp_id.strip()
+    if not hosp_name:
+        raise ValueError("請提供 --hosp-id 或 --hosp-name")
+    matches = search_clinics(hosp_name)
+    if not matches:
+        raise ValueError(f"找不到診所：{hosp_name}")
+    if len(matches) == 1:
+        print(f"找到：{matches[0]['code']} {matches[0]['name']}")
+        return matches[0]["code"]
+    print("找到多筆，請選擇：")
+    for i, m in enumerate(matches, 1):
+        print(f"  {i}. {m['code']}  {m['name']}")
+    while True:
+        try:
+            choice = int(input("輸入編號："))
+            if 1 <= choice <= len(matches):
+                return matches[choice - 1]["code"]
+        except (ValueError, KeyboardInterrupt):
+            pass
+        print("無效輸入，請重試。")
+
+
 # ── GUI 模式 ──────────────────────────────────────────────────────────────────
 def _gui():
     try:
@@ -220,9 +264,52 @@ def _gui():
     root.withdraw()
     root.attributes("-topmost", True)
 
-    hosp_id = simpledialog.askstring("診所代碼", "輸入醫事機構代碼（10碼）：", parent=root)
-    if not hosp_id:
+    # 支援輸入代碼或名稱
+    keyword = simpledialog.askstring(
+        "搜尋診所",
+        "輸入醫事機構代碼（10碼）或診所名稱（模糊搜尋）：",
+        parent=root,
+    )
+    if not keyword:
         return
+
+    keyword = keyword.strip()
+    # 判斷是代碼還是名稱
+    if keyword.isdigit() or (len(keyword) == 10 and keyword[0].isdigit()):
+        hosp_id = keyword
+    else:
+        matches = search_clinics(keyword)
+        if not matches:
+            messagebox.showerror("找不到", f"找不到診所：{keyword}")
+            root.destroy()
+            return
+        if len(matches) == 1:
+            hosp_id = matches[0]["code"]
+        else:
+            # 多筆 → 跳選單
+            win = tk.Toplevel(root)
+            win.title("選擇診所")
+            win.attributes("-topmost", True)
+            lb = tk.Listbox(win, width=50, height=min(len(matches), 15))
+            for m in matches:
+                lb.insert(tk.END, f"{m['code']}  {m['name']}")
+            lb.pack(padx=10, pady=10)
+            lb.selection_set(0)
+            selected = [None]
+
+            def confirm():
+                idx = lb.curselection()
+                if idx:
+                    selected[0] = matches[idx[0]]["code"]
+                win.destroy()
+
+            tk.Button(win, text="確認", command=confirm).pack(pady=5)
+            win.grab_set()
+            root.wait_window(win)
+            if not selected[0]:
+                root.destroy()
+                return
+            hosp_id = selected[0]
 
     excel = filedialog.askopenfilename(title="選擇「選會員」Excel", filetypes=[("Excel","*.xlsx")])
     if not excel:
@@ -260,7 +347,9 @@ def main():
         return
 
     parser = argparse.ArgumentParser(description="產生家醫計畫名單上傳 FM.txt")
-    parser.add_argument("--hosp-id",   required=True, help="醫事機構代碼（10碼）")
+    id_group = parser.add_mutually_exclusive_group(required=True)
+    id_group.add_argument("--hosp-id",   help="醫事機構代碼（10碼）")
+    id_group.add_argument("--hosp-name", help="診所名稱（模糊搜尋）")
     parser.add_argument("--excel",     required=True, type=Path, help="選會員輸出 Excel 路徑")
     parser.add_argument("--template",  type=Path, default=None, help="指定會員模板 xlsx（書田可省略）")
     parser.add_argument("--dest",      required=True, type=Path, help="輸出資料夾")
@@ -271,8 +360,9 @@ def main():
     parser.add_argument("--month",     default=None, help="上傳月份 MM（預設本月）")
     args = parser.parse_args()
 
+    hosp_id = resolve_hosp_id(args.hosp_id, args.hosp_name)
     generate(
-        hosp_id       = args.hosp_id,
+        hosp_id       = hosp_id,
         excel_path    = args.excel,
         dest_dir      = args.dest,
         template_path = args.template,
