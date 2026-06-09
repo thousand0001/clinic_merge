@@ -1,0 +1,10 @@
+{
+  "clinic_code": "350102E445",
+  "clinic_name": "安民家庭醫學科診所",
+  "source_system": "xingxiang",
+  "detection": {},
+  "encodings": ["utf-8-sig", "cp950", "big5"],
+  "sheet_aliases": {},
+  "column_aliases": {},
+  "options": {}
+}

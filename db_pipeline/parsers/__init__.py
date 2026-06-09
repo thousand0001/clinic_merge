@@ -11,6 +11,8 @@ from .醫聖 import MedicalSaintParser
 from .調和 import TiaoheParser
 from .宏誠 import HongchengParser
 from .自行系統 import CustomParser
+from .方鼎 import FangdingParser
+from .杏翔 import XingxiangParser
 
 # source_system → parser 實例的對照表
 PARSER_REGISTRY: dict = {
@@ -21,6 +23,8 @@ PARSER_REGISTRY: dict = {
     "tiaohe":        TiaoheParser(),
     "hongcheng":     HongchengParser(),
     "custom":        CustomParser(),
+    "fangding":      FangdingParser(),
+    "xingxiang":     XingxiangParser(),
 }
 
 
@@ -39,5 +43,6 @@ __all__ = [
     "ParseCoverage", "ParseResult", "SourceParser",
     "SmParser", "NewSmParser", "ProspectParser", "MedicalSaintParser",
     "TiaoheParser", "HongchengParser", "CustomParser",
+    "FangdingParser", "XingxiangParser",
     "PARSER_REGISTRY", "get_parser",
 ]

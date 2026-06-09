@@ -1,0 +1,10 @@
+{
+  "clinic_code": "3531033201",
+  "clinic_name": "崇恩診所",
+  "source_system": "fangding",
+  "detection": {},
+  "encodings": ["cp950", "big5", "utf-8-sig"],
+  "sheet_aliases": {},
+  "column_aliases": {},
+  "options": {}
+}

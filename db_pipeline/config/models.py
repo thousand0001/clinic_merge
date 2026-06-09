@@ -14,6 +14,8 @@ SUPPORTED_SOURCE_SYSTEMS = {
     "medical_saint",
     "tiaohe",
     "custom",
+    "fangding",
+    "xingxiang",
 }
 
 

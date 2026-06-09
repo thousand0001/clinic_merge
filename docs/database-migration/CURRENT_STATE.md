@@ -505,8 +505,44 @@ elif rec.selection_type in {"exclude_select", "excluded_115x"}:
 
 **吉安說明**：舊版 Excel 模板（Apr 30）只有 48 欄，不含 AW:BJ。新流程正確輸出完整 62 欄，屬新增功能。
 
-### 已知仍需補測
-- 方鼎、杏翔（ACCEPTANCE.md 標記「後續」）
+### 方鼎、杏翔補測（2026-06-09）
+
+新增解析器 `db_pipeline/parsers/方鼎.py`（FangdingParser）與 `db_pipeline/parsers/杏翔.py`（XingxiangParser）：
+
+| 診所 | 系統 | batch_id | members | claims | flags |
+|------|------|----------|---------|--------|-------|
+| 崇恩 | fangding | 8fe58132 | 2188 | 17998 | 2188 |
+| 安民 | xingxiang | 6bf5a571 | 404 | 621 | 732 |
+
+**AW:BJ 比對結果**：
+
+| 診所 | 系統 | 醫生看 AW:BJ 差異 | 備註 |
+|------|------|------------------|------|
+| 崇恩 | fangding | 0 real diffs | 舊版 Excel 無 AW:BJ 欄（0430），新版補上 ✓ |
+| 安民 | xingxiang | 0 real diffs | 舊版 Excel 無 AW:BJ 欄（0515 仍用舊模板），新版補上 ✓ |
+
+人工抽查確認：V120239846（安民）、M221103849（崇恩）AW:BJ 13 欄與照護名單完全一致。
+
+**解析器特點**：
+- 方鼎：CP950 CSV 費用檔（次數/資料夾），無姓名欄
+- 杏翔：XLSX 費用檔無身分證→使用 sm_ P4P/assay 檔建 name+birth→ID 索引比對
+- 兩者均無 lab/P4P/screening 解析（v1 範圍），不影響 AW:BJ 測試目標
+
+### 所有系統 AW:BJ 比對彙整（Phase 8 完成）
+
+| 診所 | 系統 | AW:BJ 差異 | 結論 |
+|------|------|------------|------|
+| 蘆洲大愛 | tiaohe | 0 | ✓ |
+| 鈞安 | medical_saint | 0 | ✓ |
+| 德容 | hongcheng | 0 | ✓ |
+| 書田 | custom | 0（ASCVD 預期差異）| ✓ |
+| 陳森豊 | prospect | 0（ASCVD 預期差異）| ✓ |
+| 吉安 | new_sm | 0（舊版無 AW:BJ）| ✓ 改善 |
+| 本一 | sm | 0（源文件版本差異）| ✓ |
+| 崇恩 | fangding | 0（舊版無 AW:BJ）| ✓ 改善 |
+| 安民 | xingxiang | 0（舊版無 AW:BJ）| ✓ 改善 |
+
+**所有 9 個診所 AW:BJ 欄位比對均無 real diff。**
 
 下一步：
 
