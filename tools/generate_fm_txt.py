@@ -338,8 +338,11 @@ def _gui():
     if not input_file:
         return
 
-    # 選輸出資料夾
-    dest = filedialog.askdirectory(title="選擇輸出資料夾")
+    # 選輸出資料夾（預設開到輸入檔的同一層）
+    dest = filedialog.askdirectory(
+        title="選擇輸出資料夾",
+        initialdir=str(Path(input_file).parent),
+    )
     if not dest:
         return
 
