@@ -39,7 +39,7 @@ from db_pipeline.datasets.models import (
     ScreeningRecord,
 )
 from db_pipeline.storage.contracts import StageResult
-from db_pipeline.validation.models import ValidationReport
+from db_pipeline.validation.models import ValidationIssue, ValidationReport
 
 
 # ── psql 路徑偵測（跨平台） ───────────────────────────────────────────────────
@@ -270,6 +270,23 @@ def _copy_block(table: str, columns: Sequence[str], rows: List[List[Any]]) -> st
     )
 
 
+def _validation_issue_row(
+    batch_id: str, clinic_id: int, issue: "ValidationIssue"
+) -> List[Any]:
+    row_ref = issue.source_file or ""
+    if issue.source_row:
+        row_ref = f"{row_ref}:{issue.source_row}" if row_ref else str(issue.source_row)
+    return [
+        batch_id,
+        clinic_id,
+        issue.dataset,
+        row_ref[:500],
+        issue.severity,
+        issue.code,
+        issue.message[:1000],
+    ]
+
+
 # ── 主寫入器 ──────────────────────────────────────────────────────────────────
 class PostgresStagingWriter:
     """DatasetBundle → staging.* 單一 transaction。"""
@@ -292,7 +309,22 @@ class PostgresStagingWriter:
         source_root: str = "",
         requested_by: str = "",
     ) -> StageResult:
-        sql = self._build_sql(clinic_id, batch_id, bundle, source_system, source_root, requested_by)
+        # 批次隔離：若該 batch_id 已存在，確認它屬於同一個診所
+        existing = _run_query(
+            f"SELECT clinic_id FROM meta.import_batches "
+            f"WHERE batch_id='{batch_id}'::uuid LIMIT 1;"
+        )
+        if existing and int(existing) != clinic_id:
+            raise ValueError(
+                f"批次 {batch_id} 已屬診所 clinic_id={existing}，"
+                f"不可用於診所 clinic_id={clinic_id}。"
+                f"請使用新的 batch_id 或確認診所設定是否正確。"
+            )
+        sql = self._build_sql(
+            clinic_id, batch_id, bundle,
+            source_system, source_root, requested_by,
+            validation_report,
+        )
         try:
             _run_sql(sql)
         except RuntimeError as exc:
@@ -318,6 +350,7 @@ class PostgresStagingWriter:
         source_system: str,
         source_root: str,
         requested_by: str,
+        validation_report: Optional["ValidationReport"] = None,
     ) -> str:
         bid = _esc(batch_id)
 
@@ -338,6 +371,10 @@ class PostgresStagingWriter:
         raw_rows       = [
             _raw_source_row(record, source_hashes)
             for record in bundle.raw_source_rows
+        ]
+        validation_issue_rows = [
+            _validation_issue_row(batch_id, clinic_id, issue)
+            for issue in (validation_report.issues if validation_report else [])
         ]
 
         return "".join([
@@ -370,12 +407,17 @@ class PostgresStagingWriter:
             f"SELECT {clinic_id}, '{bid}', file_path, file_name,\n"
             "       file_size, sha256, file_mtime, data_type\n"
             "FROM tmp_db_pipeline_source_files\n"
-            "ON CONFLICT (clinic_id, file_path, COALESCE(sha256, '')) DO UPDATE\n"
-            "SET batch_id = EXCLUDED.batch_id,\n"
-            "    file_name = EXCLUDED.file_name,\n"
-            "    file_size = EXCLUDED.file_size,\n"
-            "    file_mtime = EXCLUDED.file_mtime,\n"
-            "    data_type = EXCLUDED.data_type;\n\n",
+            "ON CONFLICT (clinic_id, file_path, COALESCE(sha256, '')) DO NOTHING;\n\n",
+
+            # 每個批次明確記錄它引用的 source_file_id（不改 source_files.batch_id）
+            "INSERT INTO meta.batch_source_files (batch_id, source_file_id)\n"
+            f"SELECT '{bid}', sf.source_file_id\n"
+            "FROM tmp_db_pipeline_source_files t\n"
+            "JOIN meta.source_files sf\n"
+            f"  ON sf.clinic_id = {clinic_id}\n"
+            " AND sf.file_path = t.file_path\n"
+            " AND COALESCE(sf.sha256, '') = COALESCE(t.sha256, '')\n"
+            f"ON CONFLICT (batch_id, source_file_id) DO NOTHING;\n\n",
 
             "CREATE TEMP TABLE tmp_db_pipeline_raw_rows (\n"
             "  file_path TEXT,\n"
@@ -452,6 +494,13 @@ class PostgresStagingWriter:
                 "test_type", "result_value", "result_date",
                 "raw_data", "row_hash",
             ], lab_rows),
+
+            # 每次 staging 重新寫入驗證紀錄（先刪舊的）
+            f"DELETE FROM meta.validation_errors WHERE batch_id='{bid}';\n",
+            _copy_block("meta.validation_errors", [
+                "batch_id", "clinic_id", "table_name",
+                "row_ref", "severity", "error_code", "message",
+            ], validation_issue_rows) if validation_issue_rows else "",
 
             f"UPDATE meta.import_batches SET status='validated', validated_at=now() "
             f"WHERE batch_id='{bid}';\n\n",

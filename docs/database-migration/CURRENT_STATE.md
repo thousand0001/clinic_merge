@@ -544,6 +544,30 @@ elif rec.selection_type in {"exclude_select", "excluded_115x"}:
 
 **所有 9 個診所 AW:BJ 欄位比對均無 real diff。**
 
+## 2026-06-09 資料庫安全性修正（Codex 審查後）
+
+Codex 完整驗證後，依「批次隔離 → 來源檔追溯 → 驗證紀錄 → 統一架構 → 輸出稽核」順序修正。
+
+### 已完成（Bug #9–#13）
+
+| # | 問題 | 修正 |
+|---|------|------|
+| 9 | `115_avg_amount` 分子只算 Q1，分母卻含全年月數 | 分子改為全年總額，含新回歸測試 |
+| 10 | Provider 只接受 `validated`，CLI 也查 `published` | Provider 條件改 `IN ('validated','published')` |
+| 11 | **批次隔離**：非 UUID 名稱產生的 uuid5 不含診所代碼，不同診所同名批次碰撞 | seed 加入 `clinic_code`：`uuid5(NS, "{code}/{name}")` |
+| 12 | **批次隔離**：`ON CONFLICT DO UPDATE` 不驗原診所，batch 可被跨診所覆蓋 | writer `stage()` 前加 clinic_id 預檢，不符即拋錯 |
+| 13 | **來源檔追溯**：`meta.source_files ON CONFLICT DO UPDATE` 蓋掉 `batch_id`，1.9M 筆追溯斷鏈 | 改為 `DO NOTHING`；新增 `meta.batch_source_files` 聯結表記錄每批次引用的檔案 |
+| 14 | **驗證紀錄**：validation issues 傳入 writer 但從未寫入 DB；`meta.validation_errors` 恆為 0 | stage.py 合併所有 issues 傳 writer；writer 在 transaction 內 COPY 寫入 `meta.validation_errors` |
+
+### 已知但未修（架構技術債）
+
+| 問題 | 說明 | 計畫 |
+|------|------|------|
+| 批次 97dc477f 歷史污染 | 舊批次已混入 4 診所，provider 有 clinic_id 過濾故輸出正確，無法回溯修復 | 記錄為歷史資料品質問題 |
+| `staging_v1` 設計稿 vs 現行 `staging.*` | source_file_id 全為 NULL，工作表未保留 | 步驟 4：統一 staging 架構 |
+| P4P 收案/追蹤同表 | 讀取時用欄位有無推斷類型 | 步驟 4 一併重構 |
+| 輸出未寫入 `meta.generated_outputs` | 12 個 validated 批次無輸出稽核紀錄 | 步驟 5：輸出稽核 |
+
 下一步：
 
 1. Phase 9：切換評估（正式流程切換條件確認）。

@@ -210,11 +210,14 @@ def run(
         print(f"[4/5] 寫入 raw 與 staging…")
         writer = PostgresStagingWriter()
         clinic_id = writer.get_clinic_id(config.clinic_code)
+        # 合併所有 issues 傳給 writer，讓驗證紀錄完整寫入 meta.validation_errors
+        from db_pipeline.validation.models import ValidationReport
+        full_report = ValidationReport(issues=all_issues, dataset_counts=counts)
         stage_result = writer.stage(
             clinic_id=clinic_id,
             batch_id=batch_id,
             bundle=parse_result.bundle,
-            validation_report=validation,
+            validation_report=full_report,
             source_system=config.source_system,
             source_root=str(source_dir),
             requested_by=socket.gethostname(),
@@ -277,8 +280,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             batch_id = str(uuid.UUID(raw_bid))  # 驗證格式
         except ValueError:
-            # 非 UUID 字串 → 轉成確定性 UUID（uuid5），方便重跑時冪等
-            batch_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, raw_bid))
+            # 非 UUID 字串 → 轉成確定性 UUID（uuid5）
+            # 加入 clinic_code，防止不同診所同名批次產生相同 UUID
+            batch_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{config.clinic_code}/{raw_bid}"))
 
     summary = run(
         source_dir=source_dir,
