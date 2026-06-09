@@ -165,9 +165,9 @@ def build_from_bundle(bundle: DatasetBundle) -> Dict[str, Dict[str, Any]]:
         if rec.selection_type == "designated_114":
             m["designated"]    = "✔"
             m["is_114_member"] = "✔"
-        elif rec.selection_type == "self_select":
+        elif rec.selection_type in {"self_select", "self_selected_115"}:
             m["self_select"] = "✔"
-        elif rec.selection_type == "exclude_select":
+        elif rec.selection_type in {"exclude_select", "excluded_115x"}:
             m["exclude_select"] = "✔"
 
     # ── D. 檢驗結果（HbA1c / LDL / UACR） ────────────────────────────────────

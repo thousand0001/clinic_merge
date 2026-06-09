@@ -473,6 +473,41 @@ python -m db_pipeline.cli.output \
 
 **2026-06-09 最終確認**：完整端對端重跑（舊流程 → 新流程 → compare_common_output.py）三個診所，結論不變，AW:BJ 全數 0 差異（7 bug 修正後）。
 
+## 2026-06-09 Phase 8 全系統擴充測試
+
+在 Phase 7 三個代表診所之外，補測 ACCEPTANCE.md 要求的其餘三個系統。
+
+### Bug 修正（第 8 個）
+
+**`member_builder.py` flag type 對應錯誤**：staging 存的是 `self_selected_115` / `excluded_115x`，但 `member_builder.py` 只比對 `self_select` / `exclude_select`，導致自選與不選旗標完全失效（出現在自選名單 sheet 的人不對）。
+
+修正：
+```python
+elif rec.selection_type in {"self_select", "self_selected_115"}:
+    m["self_select"] = "✔"
+elif rec.selection_type in {"exclude_select", "excluded_115x"}:
+    m["exclude_select"] = "✔"
+```
+
+### 六系統 AW:BJ 比對結果
+
+| 診所 | 系統 | 醫生看 AW:BJ 差異 | 備註 |
+|------|------|------------------|------|
+| 蘆洲大愛 | tiaohe | 0（17 common）| Phase 7 ✓ |
+| 鈞安 | medical_saint | 0/30 | Phase 7 ✓ |
+| 德容 | hongcheng | 0（14 common）| Phase 7 ✓ |
+| 書田 | custom | 0/200（ASCVD 預期差異）| ✓ |
+| 陳森豊 | prospect | 0（ASCVD 預期差異）| ✓ |
+| 吉安 | new_sm | 舊版 Excel 無 AW:BJ 欄，新版補上 | ✓（改善）|
+| 本一 | sm | 0（ASCVD 預期差異）| ✓ |
+
+**本一說明**：比對發現 論質名單/高診次/非慢性病/高血壓 有差異。追查確認為**源文件版本差異**——CloudStation 在舊流程跑完（Jun 8）後同步了更新版 Excel（地址、旗標欄位均有修改），新流程 staging 讀的是最新版（值為 `0`），舊輸出用的是舊版（值為 `1`）。新流程行為正確，非 bug。
+
+**吉安說明**：舊版 Excel 模板（Apr 30）只有 48 欄，不含 AW:BJ。新流程正確輸出完整 62 欄，屬新增功能。
+
+### 已知仍需補測
+- 方鼎、杏翔（ACCEPTANCE.md 標記「後續」）
+
 下一步：
 
 1. Phase 9：切換評估（正式流程切換條件確認）。
