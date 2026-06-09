@@ -309,17 +309,36 @@ class PostgresStagingWriter:
         source_root: str = "",
         requested_by: str = "",
     ) -> StageResult:
-        # 批次隔離：若該 batch_id 已存在，確認它屬於同一個診所
+        # 契約：驗證失敗不得寫入
+        if validation_report and not validation_report.is_valid:
+            raise ValueError(
+                f"驗證報告含錯誤，不得寫入 staging。"
+                f"錯誤數：{sum(1 for i in validation_report.issues if i.severity=='error')}"
+            )
+
+        bid = _esc(batch_id)
+
+        # 批次隔離預檢（transaction 外）
         existing = _run_query(
             f"SELECT clinic_id FROM meta.import_batches "
-            f"WHERE batch_id='{batch_id}'::uuid LIMIT 1;"
+            f"WHERE batch_id='{bid}'::uuid LIMIT 1;"
         )
         if existing and int(existing) != clinic_id:
             raise ValueError(
                 f"批次 {batch_id} 已屬診所 clinic_id={existing}，"
                 f"不可用於診所 clinic_id={clinic_id}。"
-                f"請使用新的 batch_id 或確認診所設定是否正確。"
             )
+
+        # 批次記錄先獨立提交（transaction 外），確保 rollback 後仍可更新 status='failed'
+        _run_sql(
+            f"INSERT INTO meta.import_batches "
+            f"(batch_id, clinic_id, source_system, import_mode, scope, status, source_root, requested_by) "
+            f"VALUES ('{bid}', {clinic_id}, '{_esc(source_system)}', 'replace_scope', '{{}}', 'staged', "
+            f"'{_esc(source_root)}', '{_esc(requested_by)}') "
+            f"ON CONFLICT (batch_id) DO UPDATE SET status='staged', started_at=now(), message=NULL "
+            f"WHERE import_batches.clinic_id = EXCLUDED.clinic_id;\n"
+        )
+
         sql = self._build_sql(
             clinic_id, batch_id, bundle,
             source_system, source_root, requested_by,
@@ -331,7 +350,7 @@ class PostgresStagingWriter:
             try:
                 _run_query(
                     f"UPDATE meta.import_batches SET status='failed', "
-                    f"message='{_esc(str(exc)[:500])}' WHERE batch_id='{_esc(batch_id)}';"
+                    f"message='{_esc(str(exc)[:500])}' WHERE batch_id='{bid}';"
                 )
             except Exception:
                 pass
@@ -377,14 +396,13 @@ class PostgresStagingWriter:
             for issue in (validation_report.issues if validation_report else [])
         ]
 
+        final_status = (
+            "'validated', validated_at=now()"
+            if (validation_report and validation_report.is_valid) else "'staged'"
+        )
+
         return "".join([
             "BEGIN;\n\n",
-
-            f"INSERT INTO meta.import_batches "
-            f"(batch_id, clinic_id, source_system, import_mode, scope, status, source_root, requested_by) "
-            f"VALUES ('{bid}', {clinic_id}, '{_esc(source_system)}', 'replace_scope', '{{}}', 'staged', "
-            f"'{_esc(source_root)}', '{_esc(requested_by)}') "
-            f"ON CONFLICT (batch_id) DO UPDATE SET status='staged', started_at=now(), message=NULL;\n\n",
 
             "CREATE TEMP TABLE tmp_db_pipeline_source_files (\n"
             "  file_path TEXT,\n"
@@ -409,7 +427,8 @@ class PostgresStagingWriter:
             "FROM tmp_db_pipeline_source_files\n"
             "ON CONFLICT (clinic_id, file_path, COALESCE(sha256, '')) DO NOTHING;\n\n",
 
-            # 每個批次明確記錄它引用的 source_file_id（不改 source_files.batch_id）
+            # 每個批次明確記錄它引用的 source_file_id（先清再寫，確保與當次來源資料夾一致）
+            f"DELETE FROM meta.batch_source_files WHERE batch_id='{bid}';\n",
             "INSERT INTO meta.batch_source_files (batch_id, source_file_id)\n"
             f"SELECT '{bid}', sf.source_file_id\n"
             "FROM tmp_db_pipeline_source_files t\n"
@@ -502,7 +521,7 @@ class PostgresStagingWriter:
                 "row_ref", "severity", "error_code", "message",
             ], validation_issue_rows) if validation_issue_rows else "",
 
-            f"UPDATE meta.import_batches SET status='validated', validated_at=now() "
+            f"UPDATE meta.import_batches SET status={final_status} "
             f"WHERE batch_id='{bid}';\n\n",
 
             "COMMIT;\n",
