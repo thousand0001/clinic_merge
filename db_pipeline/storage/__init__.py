@@ -338,15 +338,25 @@ class PostgresStagingWriter:
             f"ON CONFLICT (batch_id) DO UPDATE SET status='staged', started_at=now(), message=NULL "
             f"WHERE import_batches.clinic_id = EXCLUDED.clinic_id;\n"
         )
-
-        sql = self._build_sql(
-            clinic_id, batch_id, bundle,
-            source_system, source_root, requested_by,
-            validation_report,
+        # P1：WHERE 不符時 INSERT 靜默 0 rows，必須確認批次確實屬於本診所
+        actual = _run_query(
+            f"SELECT clinic_id FROM meta.import_batches WHERE batch_id='{bid}'::uuid LIMIT 1;"
         )
+        if not actual or int(actual) != clinic_id:
+            raise ValueError(
+                f"批次 {batch_id} 屬於診所 clinic_id={actual}，"
+                f"不可用於診所 clinic_id={clinic_id}。"
+            )
+
+        # P2：_build_sql 與 _run_sql 同在 try 內，任何例外都能標 failed
         try:
+            sql = self._build_sql(
+                clinic_id, batch_id, bundle,
+                source_system, source_root, requested_by,
+                validation_report,
+            )
             _run_sql(sql)
-        except RuntimeError as exc:
+        except Exception as exc:
             try:
                 _run_query(
                     f"UPDATE meta.import_batches SET status='failed', "
