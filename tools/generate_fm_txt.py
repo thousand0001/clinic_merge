@@ -255,6 +255,7 @@ def generate(
     serial: str = "01",
     prsn_id: str = DEFAULT_PRSN_ID,
     upload_month: str | None = None,
+    confirm_overwrite=None,  # callable(Path) -> bool；None = 直接覆蓋
 ) -> list[Path]:
     # 讀 Excel
     hosp_id_from_file, rows = _read_input(input_path)
@@ -307,6 +308,11 @@ def generate(
         sn = f"{serial_int:02d}"
         fname = f"{branch}{hosp_id}{month}{sn}FM.txt"
         out_path = dest_dir / fname
+        if out_path.exists() and confirm_overwrite is not None:
+            if not confirm_overwrite(out_path):
+                print(f"  跳過：{fname}")
+                serial_int += 1
+                continue
         with open(out_path, "wb") as fh:
             for rec in chunk:
                 fh.write(rec + b"\r\n")
@@ -340,10 +346,14 @@ def _gui():
 
     dest = Path(input_file).parent / "fm-txt"
 
+    def _ask_overwrite(path: Path) -> bool:
+        return messagebox.askyesno("檔案已存在", f"{path.name}\n\n要覆蓋嗎？")
+
     try:
         out = generate(
-            input_path = Path(input_file),
-            dest_dir   = dest,
+            input_path        = Path(input_file),
+            dest_dir          = dest,
+            confirm_overwrite = _ask_overwrite,
         )
         messagebox.showinfo("完成", "已產生：\n" + "\n".join(str(p) for p in out))
     except Exception as e:
