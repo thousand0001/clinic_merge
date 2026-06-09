@@ -85,7 +85,7 @@ class PostgresDataProvider:
             "JOIN meta.clinics c ON c.clinic_id=b.clinic_id "
             f"WHERE b.batch_id='{batch_id}'::uuid "
             f"AND c.clinic_code='{clinic_code}' "
-            "AND b.status='validated' LIMIT 1;"
+            "AND b.status IN ('validated','published') LIMIT 1;"
         )
         if not metadata:
             raise ValueError(

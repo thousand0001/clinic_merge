@@ -117,8 +117,21 @@ class TestLMNO(unittest.TestCase):
         self.assertEqual(m["115_count"], 12.0)
         # N：114全年總額（120000）/ 12
         self.assertAlmostEqual(m["114_avg_amount"], round(120000 / 12, 2))
-        # O：115 Q1 總額（120000）/ distinct 115 月數（3）
+        # O：115 全年總額（120000）/ distinct 115 月數（3）
         self.assertAlmostEqual(m["115_avg_amount"], round(120000 / 3, 2))
+
+    def test_115_avg_includes_non_q1_months(self):
+        """115_avg_amount 分子為全年總額（非僅 Q1），分母為有資料的月數。"""
+        bundle = DatasetBundle(
+            monthly_claims=[
+                self._claim("Z123456789", 115, 1, 1, 100),  # Q1
+                self._claim("Z123456789", 115, 5, 1, 100),  # 非 Q1
+            ],
+        )
+        members = build_from_bundle(bundle)
+        m = members["Z123456789"]
+        # 全年 200 ÷ 2 月 = 100（非 Q1 僅算 Q1 的舊 bug 會得 50）
+        self.assertAlmostEqual(m["115_avg_amount"], 100.0)
 
     def test_114_full_year_denominator(self):
         """114_avg_amount 分母固定為 12（全年），不限 Q1。"""

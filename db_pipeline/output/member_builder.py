@@ -111,7 +111,6 @@ def build_from_bundle(bundle: DatasetBundle) -> Dict[str, Dict[str, Any]]:
         "114_count_full":   0.0,
         "115_count":        0.0,
         "114_amount_total": 0.0,
-        "115_amount_q1":    0.0,
         "115_amount_total": 0.0,
         "last_visit":       "",
         "115_months":       set(),   # per-person distinct 115 months (for O denominator)
@@ -131,8 +130,6 @@ def build_from_bundle(bundle: DatasetBundle) -> Dict[str, Dict[str, Any]]:
             agg["115_months"].add(rec.month)
             agg["115_count"]        += count
             agg["115_amount_total"] += amount
-            if rec.month <= 4:
-                agg["115_amount_q1"] += amount
         # last_visit
         if rec.last_visit_date:
             iso = rec.last_visit_date.isoformat()
@@ -152,8 +149,8 @@ def build_from_bundle(bundle: DatasetBundle) -> Dict[str, Dict[str, Any]]:
             if sums["114_amount_total"] else None
         )
         m["115_avg_amount"] = (                                   # O
-            round(sums["115_amount_q1"] / month_count_115, 2)
-            if sums["115_amount_q1"] else None
+            round(sums["115_amount_total"] / month_count_115, 2)
+            if sums["115_amount_total"] else None
         )
         if sums["last_visit"] and not m.get("last_visit"):
             m["last_visit"] = sums["last_visit"]
