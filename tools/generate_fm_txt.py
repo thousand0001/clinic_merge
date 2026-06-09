@@ -81,7 +81,7 @@ def case_abc(v) -> str:
 
 
 def fb(value, byte_len: int, encoding: str = "cp950") -> bytes:
-    b = ("" if value is None else str(value)).encode(encoding, errors="replace")
+    b = ("" if value is None else str(value)).strip().encode(encoding, errors="replace")
     while len(b) > byte_len:
         b = b[:-1]
     return b + b" " * (byte_len - len(b))
@@ -285,7 +285,7 @@ def generate(
         birthday    = r["birthday"]    or m.get("birthday", "")
         name        = r["name"]        or m.get("name", "")
         tel         = r["tel"]         or m.get("tel", "") or clinic_phone
-        addr        = r.get("address", "") or m.get("address", "") or clinic_addr
+        addr        = r.get("address", "") or m.get("address", "")
         member_type = r["member_type"] or m.get("member_type", "")
         records.append(make_record(
             plan_no   = plan_no,
