@@ -162,15 +162,14 @@ ORDER BY m.patient_id_normalized, b.started_at DESC;
 def _read_input(input_path: Path) -> tuple[str | None, list[dict]]:
     """
     讀取輸入 Excel，回傳 (hosp_id_from_file, rows)。
-    每個 row dict 含 pid, birthday, member_type（可能為空）。
+    每個 row dict 含 pid, name, birthday, tel, member_type（沒有的欄位為空字串）。
 
     支援：
-      - 指定會員模板：欄 A=院所ID, B=ID, C=BIRTHDAY, D=個案類別
-      - 選會員 Excel：sheet 醫生看..., 欄 A=ID, B=姓名, C=生日, AW=個案類別
+      - 指定會員模板：欄 A=院所ID, B=ID, C=BIRTHDAY, D=個案類別（無姓名/電話欄）
+      - 選會員 Excel：sheet 醫生看..., 欄 A=ID, B=姓名, C=生日, E/F=電話, AW=個案類別
     """
     wb = openpyxl.load_workbook(input_path, read_only=True, data_only=True)
 
-    # 嘗試偵測格式
     ws = wb.active
     first_row = next(ws.iter_rows(min_row=2, max_row=2, values_only=True), None)
 
@@ -178,7 +177,7 @@ def _read_input(input_path: Path) -> tuple[str | None, list[dict]]:
     hosp_id_from_file = None
 
     if first_row and str(first_row[0] or "").strip().isdigit() and len(str(first_row[0] or "").strip()) == 10:
-        # 格式 A：指定會員模板（欄 A = 院所ID）
+        # 格式 A：指定會員模板（欄 A = 院所ID，無姓名/電話）
         hosp_id_from_file = str(first_row[0]).strip()
         for row in ws.iter_rows(min_row=2, values_only=True):
             pid = str(row[1]).strip() if row[1] else None
@@ -186,27 +185,43 @@ def _read_input(input_path: Path) -> tuple[str | None, list[dict]]:
                 continue
             rows.append({
                 "pid":         pid,
+                "name":        "",
                 "birthday":    to_yyyymmdd(row[2]) if len(row) > 2 else "",
+                "tel":         "",
                 "member_type": str(row[3]).strip() if len(row) > 3 and row[3] is not None else "",
             })
     else:
         # 格式 B：選會員 Excel，找「醫生看」sheet
-        sheet_name = next(
-            (s for s in wb.sheetnames if "醫生看" in s), None
-        )
+        sheet_name = next((s for s in wb.sheetnames if "醫生看" in s), None)
         if sheet_name is None:
             raise ValueError(
                 f"無法識別 Excel 格式：{input_path.name}\n"
                 "請選擇「指定會員模板」或「選會員 Excel」。"
             )
+        # 從檔名推斷診所名稱（例：書田泌尿科眼科診所選會員_0609_1548.xlsx → 書田泌尿科眼科診所）
+        import re as _re
+        m = _re.match(r"(.+?)選會員", input_path.stem)
+        if m:
+            clinic_name_hint = m.group(1).strip()
+            matches = search_clinics(clinic_name_hint)
+            if len(matches) == 1:
+                hosp_id_from_file = matches[0]["code"]
+            elif len(matches) > 1:
+                # 取名稱最接近的
+                hosp_id_from_file = matches[0]["code"]
+
         ws2 = wb[sheet_name]
         for row in ws2.iter_rows(min_row=4, values_only=True):
             pid = str(row[0]).strip() if row[0] else None
             if not pid or pid == "None":
                 continue
+            tel = str(row[4]).strip() if len(row) > 4 and row[4] else (
+                  str(row[5]).strip() if len(row) > 5 and row[5] else "")
             rows.append({
                 "pid":         pid,
+                "name":        str(row[1]).strip() if len(row) > 1 and row[1] else "",
                 "birthday":    to_yyyymmdd(row[2]) if len(row) > 2 else "",
+                "tel":         tel,
                 "member_type": str(row[48]).strip() if len(row) > 48 and row[48] is not None else "",
             })
 
@@ -259,12 +274,14 @@ def generate(
     db = _build_db_lookup(hosp_id)
     print(f"  DB 會員筆數：{len(db)}")
 
-    # 組 records
+    # 組 records（檔案有的欄位優先，沒有再從 DB 補）
     records = []
     for r in rows:
         pid = r["pid"]
         m   = db.get(pid, {})
-        birthday    = r["birthday"] or m.get("birthday", "")
+        birthday    = r["birthday"]    or m.get("birthday", "")
+        name        = r["name"]        or m.get("name", "")
+        tel         = r["tel"]         or m.get("tel", "") or clinic_phone
         member_type = r["member_type"] or m.get("member_type", "")
         records.append(make_record(
             plan_no   = plan_no,
@@ -272,10 +289,10 @@ def generate(
             hosp_id   = hosp_id,
             pid       = pid,
             birthday  = birthday or "        ",
-            name      = m.get("name", ""),
+            name      = name,
             sex       = sex_from_id(pid),
             addr      = clinic_addr,
-            tel       = m.get("tel", "") or clinic_phone,
+            tel       = tel,
             prsn_id   = prsn_id,
             case_type = case_abc(member_type),
             case_date = TODAY,
