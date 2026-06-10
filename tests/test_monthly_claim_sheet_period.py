@@ -6,8 +6,8 @@ from pathlib import Path
 from openpyxl import Workbook
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "選會員_共用核心_0610.py"
-SPEC = importlib.util.spec_from_file_location("member_core_0610", MODULE_PATH)
+MODULE_PATH = Path(__file__).resolve().parents[1] / "選會員_共用核心_0611.py"
+SPEC = importlib.util.spec_from_file_location("member_core_0611", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 CORE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = CORE
