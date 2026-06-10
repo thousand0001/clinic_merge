@@ -7,11 +7,11 @@ from openpyxl import Workbook
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE_PATH = ROOT / "選會員_共用核心_0611.py"
+CORE_PATH = ROOT / "選會員_共用核心_0610.py"
 
 
 def _load_core():
-    spec = importlib.util.spec_from_file_location("member_merge_core_0611", CORE_PATH)
+    spec = importlib.util.spec_from_file_location("member_merge_core_0610", CORE_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
