@@ -342,7 +342,7 @@ def _convert_count_csvs(
 
 # ─── 後處理：補填共用核心因年份過濾漏掉的最後就診日 ──────────────────────────────
 
-_ID_CANDS_OUT = ("身分證號", "身份證號", "ID", "家醫收案會員ID")
+_ID_CANDS_OUT = ("身分證號", "身份證號", "身分證號碼", "身份證號碼", "ID", "家醫收案會員ID")
 
 
 def _post_fill_last_visit(output_path: Path, last_visit_dict: Dict[str, str]) -> None:
