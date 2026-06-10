@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-耀聖系統前置清洗 + 共用核心包裝（0610）
+耀聖系統前置清洗 + 共用核心包裝（0611）
 
 用途：
 - 耀聖 HIS 的 最後就診日.CSV 只有病歷號/姓名/生日，無身分證號。
@@ -201,18 +201,18 @@ def _convert_last_visit_csv(
     source_dir: Path,
     identity_map: Dict[Tuple[str, str], str],
     out_dir: Path,
-) -> int:
+) -> Tuple[int, Dict[str, str]]:
     """
     讀取 source_dir 的 最後就診日.CSV，用 identity_map 補齊 ID，
     輸出 耀聖_最後就診日_補正.xlsx（sheet「門診次數費用」含日期欄，count=0）
     供共用核心填最後就診日。原始 CSV 會被移除，避免共用核心重複解析。
-    回傳成功匹配的筆數。
+    回傳 (成功匹配筆數, pid→date_iso 字典)；後者用於 post-processing 補填年份 114/115 外的日期。
     """
     candidates = sorted(
         list(source_dir.glob("最後就診日*.CSV")) + list(source_dir.glob("最後就診日*.csv"))
     )
     if not candidates:
-        return 0
+        return 0, {}
 
     latest: Dict[str, Tuple[str, str]] = {}  # pid → (name, date_iso)
     unmatched = 0
@@ -249,7 +249,7 @@ def _convert_last_visit_csv(
     if not latest:
         if unmatched:
             print(f"  最後就診日：0 筆命中（{unmatched} 筆找不到 ID）", flush=True)
-        return 0
+        return 0, {}
 
     wb = Workbook()
     ws = wb.active
@@ -259,7 +259,8 @@ def _convert_last_visit_csv(
         ws.append([pid, name, date, 0, 0])
     wb.save(out_dir / "耀聖_最後就診日_補正.xlsx")
     print(f"  最後就診日：{len(latest)} 筆已補 ID，{unmatched} 筆找不到 ID", flush=True)
-    return len(latest)
+    last_visit_dict = {pid: date_iso for pid, (_, date_iso) in latest.items()}
+    return len(latest), last_visit_dict
 
 
 # ─── 次數 CSV 轉換 ────────────────────────────────────────────────────────────
@@ -339,6 +340,66 @@ def _convert_count_csvs(
     return total
 
 
+# ─── 後處理：補填共用核心因年份過濾漏掉的最後就診日 ──────────────────────────────
+
+_ID_CANDS_OUT = ("身分證號", "身份證號", "ID", "家醫收案會員ID")
+
+
+def _post_fill_last_visit(output_path: Path, last_visit_dict: Dict[str, str]) -> None:
+    """
+    共用核心只處理 ROC 114-115 的日期，ROC 113（2024）就診日會被略過。
+    輸出後再掃一次總表，對 K 欄（最後就診日）仍為空的會員補填日期。
+    """
+    if not last_visit_dict or not output_path.exists():
+        return
+
+    wb = load_workbook(output_path)
+    changed = 0
+
+    for ws in wb.worksheets:
+        id_col: Optional[int] = None
+        lv_col: Optional[int] = None
+        header_row: Optional[int] = None
+
+        max_scan = min(10, ws.max_row or 0)
+        for row_idx in range(1, max_scan + 1):
+            cells = [
+                str(ws.cell(row_idx, c).value or "").strip()
+                for c in range(1, (ws.max_column or 0) + 1)
+            ]
+            if any(c in cells for c in _ID_CANDS_OUT) and "最後就診日" in cells:
+                header_row = row_idx
+                for col_idx, cell_val in enumerate(cells, start=1):
+                    if cell_val in _ID_CANDS_OUT and id_col is None:
+                        id_col = col_idx
+                    if cell_val == "最後就診日" and lv_col is None:
+                        lv_col = col_idx
+                break
+
+        if id_col is None or lv_col is None or header_row is None:
+            continue
+
+        for row_idx in range(header_row + 1, (ws.max_row or 0) + 1):
+            pid = str(ws.cell(row_idx, id_col).value or "").strip().upper()
+            if not pid or not _ID_RE.match(pid):
+                continue
+            if pid not in last_visit_dict:
+                continue
+            lv_cell = ws.cell(row_idx, lv_col)
+            if lv_cell.value is not None:
+                continue
+            try:
+                lv_cell.value = datetime.date.fromisoformat(last_visit_dict[pid])
+                changed += 1
+            except ValueError:
+                pass
+
+    if changed:
+        wb.save(output_path)
+        print(f"  後處理補填最後就診日：{changed} 格（包含 ROC 113 / 2024 年份）", flush=True)
+    wb.close()
+
+
 # ─── 主流程 ──────────────────────────────────────────────────────────────────
 
 def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
@@ -364,17 +425,20 @@ def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
         has_count_dir = (temp_source / "次數").is_dir()
 
         matched = 0
+        last_visit_dict: Dict[str, str] = {}
         if has_last_visit or has_count_dir:
             print("建立姓名+生日 → ID 對照表…", flush=True)
             identity_map = build_identity_map(temp_source)
             print(f"  對照表：{len(identity_map)} 筆", flush=True)
             if has_last_visit:
-                matched += _convert_last_visit_csv(temp_source, identity_map, temp_source)
+                count, last_visit_dict = _convert_last_visit_csv(temp_source, identity_map, temp_source)
+                matched += count
             if has_count_dir:
                 matched += _convert_count_csvs(temp_source, identity_map, temp_source)
         print(f"前置清洗完成，補正 {matched} 筆", flush=True)
 
-        temp_output  = Path(generic.process_excel(str(temp_source), template))
+        temp_output = Path(generic.process_excel(str(temp_source), template))
+        _post_fill_last_visit(temp_output, last_visit_dict)
         final_output = source_dir.parent / temp_output.name
         if final_output.exists():
             final_output.unlink()
