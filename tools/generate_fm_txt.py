@@ -32,7 +32,6 @@ from pathlib import Path
 import openpyxl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from db_pipeline.normalization import branch_from_address
 from db_pipeline.storage import _run_query
 
 
@@ -107,8 +106,8 @@ def make_record(
         + fb(prsn_id, 10)
         + case_type.encode()
         + fb(case_date, 8)
-        + fb("", 8)
-        + b" "
+        + fb("1", 8)   # 結案日期固定填 1
+        + b"1"          # 結案原因固定填 1（死亡）
     )
     assert len(rec) == 208, f"記錄長度錯誤：{len(rec)}"
     return rec
@@ -310,7 +309,7 @@ def generate(
     # 診所資料
     clinic_addr, clinic_phone = _clinic_info(hosp_id)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    branch = branch_from_address(clinic_addr) or 1
+    branch = 1   # 統一填台北業務組別
     month  = upload_month or datetime.date.today().strftime("%m")
 
     # DB 會員補充
@@ -330,7 +329,7 @@ def generate(
         birthday    = r["birthday"]    or m.get("birthday", "")
         name        = r["name"]        or m.get("name", "") or x.get("name", "")
         tel         = r["tel"]         or m.get("tel", "") or x.get("tel", "") or clinic_phone
-        addr        = r.get("address", "") or m.get("address", "")
+        addr        = r.get("address", "") or m.get("address", "") or clinic_addr
         member_type = r["member_type"] or m.get("member_type", "")
         records.append(make_record(
             plan_no   = plan_no,

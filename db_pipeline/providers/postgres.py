@@ -56,7 +56,7 @@ def _trace(
         batch_id=batch_id,
         source_system=str(raw.get("source_system") or source_system),
         source_file=str(raw.get("source_file") or ""),
-        source_sheet="",
+        source_sheet=str(raw.get("source_sheet") or ""),
         source_row=int(row.get("row_no") or 0),
         raw_row_hash=str(row.get("row_hash") or ""),
     )
@@ -85,7 +85,7 @@ class PostgresDataProvider:
             "JOIN meta.clinics c ON c.clinic_id=b.clinic_id "
             f"WHERE b.batch_id='{batch_id}'::uuid "
             f"AND c.clinic_code='{clinic_code}' "
-            "AND b.status IN ('validated','published') LIMIT 1;"
+            "AND b.status IN ('validated','published','superseded') LIMIT 1;"
         )
         if not metadata:
             raise ValueError(

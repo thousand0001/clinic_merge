@@ -18,6 +18,7 @@ DatasetBundle → staging.* 單一 transaction
 from __future__ import annotations
 
 import csv
+import dataclasses
 import io
 import json
 import os
@@ -161,6 +162,7 @@ def _member_row(batch_id: str, clinic_id: int, rec: MemberRecord) -> List[Any]:
         "hyperlipidemia":            rec.hyperlipidemia,
         "hyperglycemia":             rec.hyperglycemia,
         "source_file":               rec.trace.source_file,
+        "source_sheet":              rec.trace.source_sheet,
         "source_system":             rec.trace.source_system,
     }, ensure_ascii=False)
     return [
@@ -383,7 +385,40 @@ class PostgresStagingWriter:
     ) -> str:
         bid = _esc(batch_id)
 
-        member_rows    = [_member_row(batch_id, clinic_id, r) for r in bundle.members]
+        # Deduplicate members by person_id — merge complementary fields across records
+        seen: dict = {}
+        for r in bundle.members:
+            pid = r.person_id
+            if pid not in seen:
+                seen[pid] = r
+            else:
+                existing = seen[pid]
+                updates = {
+                    f.name: getattr(r, f.name)
+                    for f in dataclasses.fields(existing)
+                    if f.name != "trace"
+                    and (getattr(existing, f.name) is None or getattr(existing, f.name) == "")
+                    and getattr(r, f.name) not in (None, "")
+                }
+                # Always record source_file + source_sheet regardless of data field updates
+                trace_changes: dict = {}
+                existing_file = existing.trace.source_file
+                new_file = r.trace.source_file
+                if new_file and new_file not in existing_file:
+                    trace_changes["source_file"] = f"{existing_file}|{new_file}"
+                existing_sheet = existing.trace.source_sheet
+                new_sheet = r.trace.source_sheet
+                if new_sheet and new_sheet not in existing_sheet:
+                    trace_changes["source_sheet"] = (
+                        f"{existing_sheet}|{new_sheet}" if existing_sheet else new_sheet
+                    )
+                if trace_changes:
+                    updates["trace"] = dataclasses.replace(existing.trace, **trace_changes)
+                if updates:
+                    seen[pid] = dataclasses.replace(existing, **updates)
+        deduped_members = list(seen.values())
+
+        member_rows    = [_member_row(batch_id, clinic_id, r) for r in deduped_members]
         claim_rows     = [_claim_row(batch_id, clinic_id, r) for r in bundle.monthly_claims]
         flag_rows      = [_flag_row(batch_id, clinic_id, r) for r in bundle.member_selections]
         p4p_rows       = (
@@ -530,6 +565,13 @@ class PostgresStagingWriter:
                 "batch_id", "clinic_id", "table_name",
                 "row_ref", "severity", "error_code", "message",
             ], validation_issue_rows) if validation_issue_rows else "",
+
+            # Mark previous validated/published batches as superseded when this batch validates
+            (
+                f"UPDATE meta.import_batches SET status='superseded' "
+                f"WHERE clinic_id={clinic_id} AND status IN ('validated','published') AND batch_id!='{bid}';\n"
+                if (validation_report and validation_report.is_valid) else ""
+            ),
 
             f"UPDATE meta.import_batches SET status={final_status} "
             f"WHERE batch_id='{bid}';\n\n",

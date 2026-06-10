@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-選會員產檔工具 — 共用核心 0608
+選會員產檔工具 — 共用核心 0610
 
 功能概要
-- 整合所有來源 sheet 人員名單（會員名單 / ascvd / 自選名單 / 115X / P4P / 月份分頁）
+- 整合所有來源 sheet 人員名單（會員名單 / ascvd / 115指定會員 / 自選名單 / 115X / P4P / 月份分頁）
 - 套用 0325 樣板，寫入「會員指標」分頁，同步輸出：
   - 百分位名單（LDL / HbA1c 百分位）
   - 醫生看
@@ -35,7 +35,7 @@ from copy import copy
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, Iterable, List, Optional, Any, Tuple
 
 import openpyxl
 import xlrd
@@ -278,6 +278,7 @@ class SourceContext:
     sh_phone: Any
     sh_self_select: Any
     sh_115x: Any
+    sh_115_designated: Any
     sh_p4p_enroll: Any
     sh_p4p_track: Any
     screening_sheets: Dict[str, Any]
@@ -285,6 +286,9 @@ class SourceContext:
     claim_months_115: List[int]
     all_members: Dict[str, Dict[str, Any]]
     p4p_map: Dict[str, Dict[str, Any]]
+    designated_115_source_count: int
+    designated_115_ids: set[str]
+    designated_115_details: Dict[str, Dict[str, Any]]
 
 
 @dataclass
@@ -1566,8 +1570,6 @@ def fill_monthly_claim_summary_columns(
         data = claim_sums.get(pid)
 
         if not data:
-            if col_last:
-                ws.cell(rr, col_last).value = None
             ws.cell(rr, col_m).value = None
             if col_n_q1:
                 ws.cell(rr, col_n_q1).value = None
@@ -1593,10 +1595,11 @@ def fill_monthly_claim_summary_columns(
         v115_months = max(int(data.get("115_months", 0.0)), 1)
         last_visit_ord = int(data.get("last_visit_ord", 0.0) or 0)
 
-        if col_last:
-            ws.cell(rr, col_last).value = (
-                datetime.date.fromordinal(last_visit_ord) if last_visit_ord > 0 else None
-            )
+        if col_last and last_visit_ord > 0:
+            monthly_last_visit = datetime.date.fromordinal(last_visit_ord)
+            existing_last_visit = parse_date(ws.cell(rr, col_last).value)
+            if existing_last_visit is None or monthly_last_visit > existing_last_visit:
+                ws.cell(rr, col_last).value = monthly_last_visit
         ws.cell(rr, col_m).value = _to_excel_number(v114c_fy) if v114c_fy != 0 else None
         if col_n_q1:
             ws.cell(rr, col_n_q1).value = _to_excel_number(v114c) if v114c != 0 else None
@@ -3190,6 +3193,8 @@ def populate_doctor_sheet(
     p4p_map: Optional[Dict[str, Dict[str, Any]]] = None,
     claim_months_115: Optional[List[int]] = None,
     all_members: Optional[Dict[str, Dict[str, Any]]] = None,
+    designated_115_ids: Optional[set[str]] = None,
+    designated_115_details: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
     if DOCTOR_SHEET_NAME not in wb_tpl.sheetnames:
         return
@@ -3300,10 +3305,11 @@ def populate_doctor_sheet(
         ws_doc[f"AK{offset}"] = fee_score
         ws_doc[f"AL{offset}"] = exam_score
         ws_doc[f"AM{offset}"] = prevention_score
+        ws_doc[f"AQ{offset}"] = "✔" if pid_val and pid_val in (designated_115_ids or set()) else None
         if e_code in (DiseaseCode.DM, DiseaseCode.CKD, DiseaseCode.DKD):
             ws_doc[f"AP{offset}"] = None
         if has_0526_extra_columns and pid_val:
-            member_source = (all_members or {}).get(pid_val, {})
+            member_source = (designated_115_details or {}).get(pid_val, {})
             for col_letter, source_key in doctor_extra_map.items():
                 ws_doc[f"{col_letter}{offset}"] = member_source.get(source_key)
             same_clinic = normalize_text(member_source.get("same_clinic_previous_year"))
@@ -4121,8 +4127,9 @@ def collect_all_members(
             for key, value in partial.items():
                 _fill_member_field(rec, key, value)
 
-    # ── 2. ascvd / 自選名單 / 115X / P4P收案 / P4P追蹤（補充）──
-    for sname in ["ascvd", "自選名單", "115X", "P4P收案", "P4P追蹤"]:
+    # ── 2. ascvd / 115指定會員 / 自選名單 / 115X / P4P（補充）──
+    # 115 指定會員與既有會員來源做聯集；既有值不被覆蓋，只補漏列會員與缺值。
+    for sname in ["ascvd", "115指定會員", "自選名單", "115X", "P4P收案", "P4P追蹤"]:
         if sname not in snames:
             continue
         processed_sheets.add(sname)
@@ -5058,12 +5065,13 @@ def _looks_like_member_roster_sheet(src_ws: Any) -> bool:
 
 def _looks_like_member_roster_with_ascvd_sheet(src_ws: Any) -> bool:
     id_aliases = ["ID", "身份證號", "身份證號碼", "身分證號", "身分證號碼"]
-    header_row = _find_header_row_contains_any(
-        src_ws,
-        [id_aliases, ["疾病樣態"], ["ASCVD", "ascvd"]],
-        search_rows=10,
-    )
-    return header_row is not None
+    # 單列 header：ID + 疾病樣態 + ASCVD 在同一列（常見格式）
+    if _find_header_row_contains_any(src_ws, [id_aliases, ["疾病樣態"], ["ASCVD", "ascvd"]], search_rows=10) is not None:
+        return True
+    # 雙列 header：耀聖格式，ID/最後就診日在第1列，ASCVD 在第2列
+    has_id = _find_header_row_contains_any(src_ws, [id_aliases], search_rows=5) is not None
+    has_ascvd = _find_header_row_contains_any(src_ws, [["ASCVD", "ascvd"]], search_rows=5) is not None
+    return has_id and has_ascvd
 
 
 def _canonical_source_sheet_name(sheet_name: str, file_path: str, single_sheet: bool, src_ws: Any = None) -> str:
@@ -5077,6 +5085,12 @@ def _canonical_source_sheet_name(sheet_name: str, file_path: str, single_sheet: 
 
     if re.fullmatch(r"1(14|15)\d{2}", str(sheet_name)):
         return str(sheet_name)
+
+    if (
+        any(token in norm_file for token in ("115指定會員", "115年指定會員"))
+        and (single_sheet or _is_generic_sheet_title(sheet_name))
+    ):
+        return "115指定會員"
 
     if src_ws is not None and _looks_like_member_roster_with_ascvd_sheet(src_ws):
         return "ascvd"
@@ -5324,21 +5338,28 @@ def _fill_ascvd(
     id_to_rows: Dict[str, List[int]],
     meta:      Dict[int, MemberMeta],
 ) -> None:
-    # 動態找 header row（含 ID 和 ASCVD 的列）
-    ASCVD_HEADER_ROW = _find_header_row_contains_any(
-        sh_ascvd, [["ID", "id"], ["ASCVD", "ascvd"]], search_rows=10
-    ) or 5
-    amap  = build_header_map(sh_ascvd, ASCVD_HEADER_ROW)
-    # 最後就診日可能在 header_row-1（上一列）
-    amap_upper = build_header_map(sh_ascvd, ASCVD_HEADER_ROW - 1) if ASCVD_HEADER_ROW > 1 else {}
-    amap_merged = {**amap_upper, **amap}
-    a_id  = find_column_exact(amap, ["ID", "id"])
-    a_asc = find_column_exact(amap, ["ASCVD", "ascvd"])
+    # 耀聖名單的 ID / 最後就診日可能在第 1 列，ASCVD 在第 2 列。
+    id_header_row = _find_header_row_contains_any(
+        sh_ascvd, [["ID", "id"]], search_rows=10
+    )
+    ascvd_header_row = _find_header_row_contains_any(
+        sh_ascvd, [["ASCVD", "ascvd"]], search_rows=10
+    )
+    if id_header_row is None or ascvd_header_row is None:
+        raise ValueError("原始檔「ascvd」找不到 ID / ASCVD 欄位")
+
+    header_rows = sorted({id_header_row, ascvd_header_row})
+    amap_merged: Dict[str, int] = {}
+    for header_row in header_rows:
+        amap_merged.update(build_header_map(sh_ascvd, header_row))
+
+    a_id  = find_column_exact(amap_merged, ["ID", "id"])
+    a_asc = find_column_exact(amap_merged, ["ASCVD", "ascvd"])
     a_lv  = find_column_exact(amap_merged, ["最後就診日"])
     if a_id is None or a_asc is None:
         raise ValueError("原始檔「ascvd」找不到 ID / ASCVD 欄位")
 
-    for r in range(ASCVD_HEADER_ROW + 1, sh_ascvd.max_row + 1):
+    for r in range(max(header_rows) + 1, sh_ascvd.max_row + 1):
         pid = normalize_id(sh_ascvd.cell(r, a_id).value)
         val = sh_ascvd.cell(r, a_asc).value
         if not pid:
@@ -5778,6 +5799,25 @@ def load_source(
     )
     sh_p4p_enroll = _first_sheet(wb_src, "P4P收案", "收案管理", "P4pCase")
     sh_p4p_track = _first_sheet(wb_src, "P4P追蹤", "追蹤管理", "P4pTrack")
+    sh_115_designated = _first_sheet(wb_src, "115指定會員")
+    designated_115_source_ids = build_id_set(
+        sh_115_designated,
+        ["ID", "身份證號", "身份證號碼", "身分證號", "身分證號碼"],
+    ) if sh_115_designated is not None else set()
+    designated_115_details = _extract_member_partial_map(
+        sh_115_designated,
+        ["ID", "身份證號", "身份證號碼", "身分證號", "身分證號碼"],
+    ) if sh_115_designated is not None else {}
+    designated_115_ids = {
+        pid for pid in designated_115_source_ids
+        if pid in all_members
+    }
+    if sh_115_designated is not None:
+        _log(
+            "115指定會員："
+            f"有效 ID {len(designated_115_source_ids)} 筆，"
+            f"會員總表命中 {len(designated_115_ids)} 筆"
+        )
     p4p_map = build_p4p_map(sh_p4p_enroll, sh_p4p_track)
     return SourceContext(
         wb_src=wb_src,
@@ -5788,6 +5828,7 @@ def load_source(
         sh_phone=_first_sheet(wb_src, "行動電話", "基本資料檔列印"),
         sh_self_select=_first_sheet(wb_src, "自選會員", "自選名單"),
         sh_115x=_first_sheet(wb_src, "115X"),
+        sh_115_designated=sh_115_designated,
         sh_p4p_enroll=sh_p4p_enroll,
         sh_p4p_track=sh_p4p_track,
         screening_sheets={
@@ -5801,6 +5842,9 @@ def load_source(
         claim_months_115=claim_months_115,
         all_members=all_members,
         p4p_map=p4p_map,
+        designated_115_source_count=len(designated_115_source_ids),
+        designated_115_ids=designated_115_ids,
+        designated_115_details=designated_115_details,
     )
 
 
@@ -6003,6 +6047,8 @@ def compute_kpis(
         p4p_map=source_ctx.p4p_map if source_ctx is not None else None,
         claim_months_115=source_ctx.claim_months_115 if source_ctx is not None else None,
         all_members=source_ctx.all_members if source_ctx is not None else None,
+        designated_115_ids=source_ctx.designated_115_ids if source_ctx is not None else None,
+        designated_115_details=source_ctx.designated_115_details if source_ctx is not None else None,
     )
     if source_ctx:
         _log("產生自選名單工作表")

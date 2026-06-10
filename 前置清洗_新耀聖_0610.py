@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-新耀聖前置清洗 + 共用核心包裝（0608）
+新耀聖前置清洗 + 共用核心包裝（0610）
 
 用途：
 - 將含「需照護名單」的雙工作表主檔拆成乾淨的 ascvd / 會員名單
@@ -69,7 +69,10 @@ def _copy_sheet_values(src_path: Path, sheet_name: str, out_path: Path, target_t
 
 
 def _sanitize_roster_workbook(source_dir: Path) -> bool:
-    candidates = sorted(source_dir.glob("*需照護名單*.xlsx"))
+    candidates = sorted({
+        *source_dir.glob("*需照護名單*.xlsx"),
+        *source_dir.glob("*需要照護名單*.xlsx"),
+    })
     if not candidates:
         return False
 

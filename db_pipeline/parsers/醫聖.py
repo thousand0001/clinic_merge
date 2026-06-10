@@ -16,6 +16,7 @@ TXT 格式：
 from __future__ import annotations
 
 import csv
+import dataclasses
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -419,6 +420,8 @@ class MedicalSaintParser:
     ) -> int:
         wb = load_workbook(path, read_only=True, data_only=True)
         parsed = 0
+        # pid → index in bundle.members (for cross-sheet field merge)
+        seen_pids: dict = {m.person_id: i for i, m in enumerate(bundle.members)}
         try:
             for ws in wb.worksheets:
                 header_row = _find_header_row(ws, (ID_HEADERS, ("個案類別",)))
@@ -451,7 +454,7 @@ class MedicalSaintParser:
                         for fn, col in field_cols.items()
                     }
                     trace = _trace(config, batch_id, source_dir, path, ws.title, row_no, vals)
-                    bundle.members.append(MemberRecord(
+                    new_rec = MemberRecord(
                         trace=trace, person_id=pid,
                         name=normalize_name(vals[name_col]) if name_col is not None else "",
                         birth_date=parse_date(vals[birth_col]) if birth_col is not None else None,
@@ -459,10 +462,32 @@ class MedicalSaintParser:
                         mobile=normalize_phone(vals[mobile_col]) if mobile_col is not None else "",
                         address=normalize_text(vals[addr_col]) if addr_col is not None else "",
                         **kwargs,
-                    ))
-                    bundle.member_selections.append(MemberSelectionRecord(
-                        trace=trace, person_id=pid, selection_type="designated_114"))
-                    parsed += 1
+                    )
+                    if pid in seen_pids:
+                        # Merge non-empty fields; always record every visited sheet in trace
+                        idx = seen_pids[pid]
+                        existing = bundle.members[idx]
+                        updates = {
+                            f.name: getattr(new_rec, f.name)
+                            for f in dataclasses.fields(existing)
+                            if f.name != "trace"
+                            and (getattr(existing, f.name) is None or getattr(existing, f.name) == "")
+                            and getattr(new_rec, f.name) not in (None, "")
+                        }
+                        existing_sheets = existing.trace.source_sheet
+                        if ws.title not in existing_sheets:
+                            updates["trace"] = dataclasses.replace(
+                                existing.trace,
+                                source_sheet=f"{existing_sheets}|{ws.title}",
+                            )
+                        if updates:
+                            bundle.members[idx] = dataclasses.replace(existing, **updates)
+                    else:
+                        seen_pids[pid] = len(bundle.members)
+                        bundle.members.append(new_rec)
+                        bundle.member_selections.append(MemberSelectionRecord(
+                            trace=trace, person_id=pid, selection_type="designated_114"))
+                        parsed += 1
         finally:
             wb.close()
         return parsed
