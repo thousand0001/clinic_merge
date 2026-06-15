@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import unicodedata
 import warnings
 import zipfile
 import xml.etree.ElementTree as ET
@@ -289,6 +290,7 @@ class SourceContext:
     designated_115_source_count: int
     designated_115_ids: set[str]
     designated_115_details: Dict[str, Dict[str, Any]]
+    self_select_order: List[str]
 
 
 @dataclass
@@ -470,8 +472,10 @@ def normalize_phone_value(v: Any) -> Optional[str]:
     if v is None:
         return None
     digits = re.sub(r"\D+", "", str(v))
-    if len(digits) == 9 and digits.startswith("9"):
+    if len(digits) == 9 and digits.startswith(("9", "2")):
         digits = f"0{digits}"
+    elif len(digits) == 8:
+        digits = f"02{digits}"
     if len(digits) < 8:
         return None
     return digits
@@ -835,15 +839,48 @@ CKD_CODES = {
 
 
 def normalize_id(v: Any) -> str:
-    return normalize_text(v).upper()
+    return normalize_text(v).upper().replace(" ", "")
 
 
-_ID_RE = re.compile(r'^[A-Z]{1,2}\d{8,9}$')
+_ID_RE = re.compile(r'^(?:[A-Z][1289]\d{8}|[A-Z][A-D]\d{8})$')
 
 def is_valid_tw_id(v: Any) -> bool:
-    """台灣身分證/居留證格式：1英+9數 或 2英+8數"""
+    """台灣身分證/新式與舊式外來人口統一證號格式。"""
     s = normalize_text(v).upper().replace(" ", "")
     return bool(_ID_RE.match(s))
+
+
+_INVALID_ID_WARNINGS: set[Tuple[str, int, str]] = set()
+
+
+def _looks_like_person_id(value: Any) -> bool:
+    pid = normalize_id(value)
+    if not pid:
+        return False
+    if is_valid_tw_id(pid):
+        return True
+    return bool(re.fullmatch(r"[A-Z0-9]{8,10}", pid))
+
+
+def _warn_invalid_id(sheet: Any, row: int, raw_value: Any, *, action: str = "仍保留") -> None:
+    pid = normalize_id(raw_value)
+    if not pid or is_valid_tw_id(pid):
+        return
+    sheet_name = getattr(sheet, "title", "未知工作表")
+    key = (sheet_name, row, pid)
+    if key in _INVALID_ID_WARNINGS:
+        return
+    _INVALID_ID_WARNINGS.add(key)
+    _log(f"身分證號格式警示：{sheet_name} 第 {row} 列 ID={pid} 格式不符，{action}。")
+
+
+def _source_person_id(sheet: Any, row: int, raw_value: Any) -> str:
+    pid = normalize_id(raw_value)
+    if not _looks_like_person_id(pid):
+        return ""
+    if not is_valid_tw_id(pid):
+        _warn_invalid_id(sheet, row, pid)
+    return pid
 
 
 def find_id_col_by_content(sheet, header_row: int, id_col_candidate: Optional[int]) -> Optional[int]:
@@ -859,6 +896,8 @@ def find_id_col_by_content(sheet, header_row: int, id_col_candidate: Optional[in
         return False
 
     if id_col_candidate and _col_has_valid_id(id_col_candidate):
+        return id_col_candidate
+    if id_col_candidate:
         return id_col_candidate
 
     # fallback：只接受身分證類欄位、會員ID，或欄位名精確等於 ID
@@ -880,7 +919,7 @@ def _first_valid_id_row(sheet, id_col: Optional[int], header_row: int) -> int:
     if id_col is None:
         return header_row + 1
     for r in range(header_row + 1, sheet.max_row + 1):
-        if is_valid_tw_id(sheet.cell(r, id_col).value):
+        if normalize_id(sheet.cell(r, id_col).value):
             return r
     return header_row + 1
 
@@ -1379,8 +1418,8 @@ def collect_monthly_claim_summaries(
         sh = wb_src[sheet_name]
         for r in range(scan.header_row + 1, sh.max_row + 1):
             pid_raw = sh.cell(r, scan.id_col).value
-            pid = normalize_text(pid_raw).upper()
-            if not pid or not is_valid_tw_id(pid):
+            pid = _source_person_id(sh, r, pid_raw)
+            if not pid:
                 continue
 
             dt = profile.parse_date(sh.cell(r, scan.date_col).value) if scan.date_col else None
@@ -1448,7 +1487,7 @@ def _supplement_claim_counts_from_hisb(
     profile = _resolve_profile(profile)
     member_key_to_ids: Dict[Tuple[str, datetime.date], List[str]] = {}
     for pid, info in all_members.items():
-        name = normalize_text(info.get("name"))
+        name = normalize_member_name(info.get("name"))
         bday = info.get("bday")
         if not name or not isinstance(bday, datetime.date):
             continue
@@ -1476,12 +1515,12 @@ def _supplement_claim_counts_from_hisb(
 
             matched_ids: List[str] = []
             if scan.id_col:
-                pid = normalize_id(sh.cell(r, scan.id_col).value)
-                if pid and is_valid_tw_id(pid):
+                pid = _source_person_id(sh, r, sh.cell(r, scan.id_col).value)
+                if pid:
                     matched_ids = [pid]
 
             if not matched_ids and scan.bday_col:
-                name = normalize_text(sh.cell(r, scan.name_col).value)
+                name = normalize_member_name(sh.cell(r, scan.name_col).value)
                 bday = profile.parse_date(sh.cell(r, scan.bday_col).value)
                 if not name or not isinstance(bday, datetime.date):
                     continue
@@ -2822,6 +2861,7 @@ def _copy_sheet_rows(
     filter_ids: Optional[set] = None,
     id_main_col: Optional[int] = None,
     filter_check_col: Optional[int] = None,
+    source_rows: Optional[List[int]] = None,
 ) -> int:
     """
     通用：把 ws_main 的資料按 col_map 逐列 copy 到 ws_out。
@@ -2840,7 +2880,8 @@ def _copy_sheet_rows(
         for src_key, dst_letter in col_map
     ]
     dst_row = dst_data_start
-    for src_row in range(data_start, last_row + 1):
+    rows_to_copy = source_rows if source_rows is not None else list(range(data_start, last_row + 1))
+    for src_row in rows_to_copy:
         if filter_check_col:
             if normalize_text(ws_main.cell(src_row, filter_check_col).value) not in ("✔", "v", "V"):
                 continue
@@ -2860,6 +2901,35 @@ def _copy_sheet_rows(
 
     ws_out.sheet_view.showGridLines = True
     return dst_row - dst_data_start
+
+
+def _ordered_main_rows(
+    ws_main,
+    data_start: int,
+    last_row: int,
+    id_col: Optional[int],
+    preferred_id_order: Optional[List[str]] = None,
+) -> List[int]:
+    base_rows = list(range(data_start, last_row + 1))
+    if not id_col or not preferred_id_order:
+        return base_rows
+
+    row_by_pid: Dict[str, int] = {}
+    for src_row in base_rows:
+        pid = normalize_id(ws_main.cell(src_row, id_col).value)
+        if pid and pid not in row_by_pid:
+            row_by_pid[pid] = src_row
+
+    ordered_rows: List[int] = []
+    used: set[int] = set()
+    for pid in preferred_id_order:
+        src_row = row_by_pid.get(pid)
+        if src_row is not None and src_row not in used:
+            ordered_rows.append(src_row)
+            used.add(src_row)
+
+    ordered_rows.extend(src_row for src_row in base_rows if src_row not in used)
+    return ordered_rows
 
 
 def _apply_vertical_center_to_sheet(
@@ -3195,6 +3265,7 @@ def populate_doctor_sheet(
     all_members: Optional[Dict[str, Dict[str, Any]]] = None,
     designated_115_ids: Optional[set[str]] = None,
     designated_115_details: Optional[Dict[str, Dict[str, Any]]] = None,
+    preferred_id_order: Optional[List[str]] = None,
 ) -> None:
     if DOCTOR_SHEET_NAME not in wb_tpl.sheetnames:
         return
@@ -3214,6 +3285,14 @@ def populate_doctor_sheet(
         ws_doc["L2"] = "114年同期就診次數\n（未偵測到115年有效月份）"
         ws_doc["M2"] = "115年就診次數\n（未偵測到有效月份）"
         ws_doc["O2"] = "115年月平均費用\n（未偵測到有效月份）"
+    id_col = cols.get("id")
+    source_rows = _ordered_main_rows(
+        ws_main,
+        data_start,
+        last_row,
+        id_col,
+        preferred_id_order,
+    )
     n = _copy_sheet_rows(
         ws_main,
         ws_doc,
@@ -3222,6 +3301,7 @@ def populate_doctor_sheet(
         data_start,
         last_row,
         dst_data_start=4,
+        source_rows=source_rows,
     )
     today = today or datetime.date.today()
     ws_doc["P3"] = (
@@ -3249,7 +3329,6 @@ def populate_doctor_sheet(
     breakdown_col = cols.get("breakdown")
     age_col = cols.get("age")
     sex_col = cols.get("sex")
-    id_col = cols.get("id")
     abc_col = cols.get("abc")
     disease_text_col = cols.get("disease_text")
     hba_pass_col = cols.get("ak")
@@ -3273,7 +3352,7 @@ def populate_doctor_sheet(
         "BI": "hyperglycemia",
     }
     doctor_alert_font = Font(bold=True, color="FF0000")
-    for offset, src_row in enumerate(range(data_start, last_row + 1), start=4):
+    for offset, src_row in enumerate(source_rows, start=4):
         visit_score = fee_score = exam_score = prevention_score = None
         if breakdown_col:
             visit_score, fee_score, exam_score, prevention_score = _extract_score_components(
@@ -3502,6 +3581,7 @@ def populate_self_select_sheet(
     data_start: int,
     last_row: int,
     sh_self_select: Any,
+    preferred_id_order: Optional[List[str]] = None,
 ) -> None:
     if SELF_SELECT_SHEET_NAME not in wb_tpl.sheetnames:
         return
@@ -3513,10 +3593,19 @@ def populate_self_select_sheet(
 
     src_col_map = _build_src_col_map(_SELF_SELECT_COL_MAP, cols)
     ws_out = wb_tpl[SELF_SELECT_SHEET_NAME]
+    id_col = cols.get("id")
+    source_rows = _ordered_main_rows(
+        ws_main,
+        data_start,
+        last_row,
+        id_col,
+        preferred_id_order,
+    )
     n = _copy_sheet_rows(
         ws_main, ws_out, _SELF_SELECT_COL_MAP, src_col_map,
         data_start, last_row,
         filter_check_col=self_select_col,
+        source_rows=source_rows,
     )
 
     score_col = cols.get("score")
@@ -3536,7 +3625,7 @@ def populate_self_select_sheet(
     ws_out.cell(2, hidden_col_indexes["prevention_score"]).value = "預防保健"
 
     dst_row = 3
-    for src_row in range(data_start, last_row + 1):
+    for src_row in source_rows:
         if normalize_text(ws_main.cell(src_row, self_select_col).value) not in ("✔", "v", "V"):
             continue
 
@@ -3850,10 +3939,10 @@ def _extract_id_name_map(sheet, id_aliases: List[str]) -> Dict[str, str]:
     hmap = build_header_map(sheet, hrow)
     name_col = find_column_exact(hmap, ["姓名", "會員姓名", "名字"])
     for r in range(hrow + 1, sheet.max_row + 1):
-        pid = normalize_id(sheet.cell(r, id_col).value)
-        if pid and is_valid_tw_id(pid):
+        pid = _source_person_id(sheet, r, sheet.cell(r, id_col).value)
+        if pid:
             name = sheet.cell(r, name_col).value if name_col else None
-            result.setdefault(pid, normalize_text(name) if name else "")
+            result.setdefault(pid, normalize_member_name(name) if name else "")
     return result
 
 
@@ -3903,8 +3992,42 @@ def _fill_member_roster_extra_fields(
             _fill_member_field(rec, key, sheet.cell(row, col).value)
 
 
+def normalize_member_name(value: Any) -> str:
+    if value is None:
+        return ""
+    text = normalize_text(value)
+    text = re.sub(r"[\s　]+", "", text)
+    text = re.sub(r"[.．。]+$", "", text).strip()
+    return text
+
+
+def _name_noise_score(value: Any) -> int:
+    text = normalize_member_name(value)
+    if not text:
+        return 10_000
+    score = 0
+    score += text.count("\ufffd") * 100
+    score += sum(1 for ch in text if "\ue000" <= ch <= "\uf8ff") * 100
+    score += sum(1 for ch in text if unicodedata.category(ch) == "Cc") * 100
+    score += max(0, 2 - len(text)) * 10
+    score -= sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return score
+
+
+def _fill_member_name_field(rec: Dict[str, Any], value: Any) -> None:
+    incoming = normalize_member_name(value)
+    if not incoming:
+        return
+    current = normalize_member_name(rec.get("name"))
+    if not current or _name_noise_score(incoming) < _name_noise_score(current):
+        rec["name"] = incoming
+
+
 def _fill_member_field(rec: Dict[str, Any], key: str, value: Any) -> None:
     """只在記錄中該欄位尚未有值時才填入（缺什麼補什麼）。"""
+    if key == "name":
+        _fill_member_name_field(rec, value)
+        return
     if value is not None and value != "" and not rec.get(key):
         rec[key] = value
 
@@ -3943,13 +4066,13 @@ def _extract_member_partial_map(
 
     result: Dict[str, Dict[str, Any]] = {}
     for r in range(data_start_row, sheet.max_row + 1):
-        pid = normalize_id(sheet.cell(r, id_col).value)
-        if not pid or not is_valid_tw_id(pid):
+        pid = _source_person_id(sheet, r, sheet.cell(r, id_col).value)
+        if not pid:
             continue
 
         rec = result.setdefault(pid, _empty_member())
         if name_col:
-            _fill_member_field(rec, "name", normalize_text(sheet.cell(r, name_col).value))
+            _fill_member_field(rec, "name", sheet.cell(r, name_col).value)
         if bday_col:
             _fill_member_field(rec, "bday", parse_date(sheet.cell(r, bday_col).value))
         if dmk_col:
@@ -4019,7 +4142,7 @@ def _extract_member_noid_rows(
 
     out: List[Dict[str, Any]] = []
     for r in range(header_row + 1, sheet.max_row + 1):
-        name = normalize_text(sheet.cell(r, name_col).value) if name_col else ""
+        name = normalize_member_name(sheet.cell(r, name_col).value) if name_col else ""
         if not name:
             continue
         rec = _empty_member()
@@ -4186,14 +4309,14 @@ def collect_all_members(
                     if not phone_cols:
                         phone_cols = [8]
             for r in range(data_start_row, sh.max_row + 1):
-                pid = normalize_id(sh.cell(r, id_col).value)
-                if not pid or not is_valid_tw_id(pid):
+                pid = _source_person_id(sh, r, sh.cell(r, id_col).value)
+                if not pid:
                     continue
                 rec = _get_or_create(pid)
                 contact = pick_contact_from_values([sh.cell(r, c).value for c in phone_cols])
                 address = normalize_text(sh.cell(r, addr_col).value) if addr_col else ""
                 if name_col:
-                    _fill_member_field(rec, "name", normalize_text(sh.cell(r, name_col).value))
+                    _fill_member_field(rec, "name", sh.cell(r, name_col).value)
                 if bday_col:
                     _fill_member_field(rec, "bday", parse_date(sh.cell(r, bday_col).value))
                 if abc_col:
@@ -4250,8 +4373,8 @@ def build_contact_map(sh_phone: Any) -> Dict[str, ContactInfo]:
         return {}
     result: Dict[str, ContactInfo] = {}
     for r in range(header_row + 1, sh_phone.max_row + 1):
-        pid = normalize_id(sh_phone.cell(r, id_col).value)
-        if not pid or not is_valid_tw_id(pid):
+        pid = _source_person_id(sh_phone, r, sh_phone.cell(r, id_col).value)
+        if not pid:
             continue
         contact = pick_contact_from_values([sh_phone.cell(r, c).value for c in phone_cols])
         address = normalize_text(sh_phone.cell(r, addr_col).value) if addr_col else ""
@@ -4390,8 +4513,8 @@ def build_p4p_map(sh_enroll: Any, sh_track: Any) -> Dict[str, Dict[str, Any]]:
         status_col = find_column_exact(hmap, ["收案狀態"])
         if id_col:
             for r in range(2, sh_enroll.max_row + 1):
-                pid = normalize_id(sh_enroll.cell(r, id_col).value)
-                if not pid or not is_valid_tw_id(pid):
+                pid = _source_person_id(sh_enroll, r, sh_enroll.cell(r, id_col).value)
+                if not pid:
                     continue
                 d = result.setdefault(pid, {"records": []})
                 plan = normalize_text(sh_enroll.cell(r, plan_col).value) if plan_col else ""
@@ -4410,8 +4533,8 @@ def build_p4p_map(sh_enroll: Any, sh_track: Any) -> Dict[str, Dict[str, Any]]:
         overdue_col    = find_column_exact(hmap, ["逾期未追蹤"])
         if id_col:
             for r in range(2, sh_track.max_row + 1):
-                pid = normalize_id(sh_track.cell(r, id_col).value)
-                if not pid or not is_valid_tw_id(pid):
+                pid = _source_person_id(sh_track, r, sh_track.cell(r, id_col).value)
+                if not pid:
                     continue
                 d = result.setdefault(pid, {"records": []})
                 plan = normalize_text(sh_track.cell(r, plan_col).value) if plan_col else ""
@@ -4449,8 +4572,8 @@ def build_id_set(sheet: Any, id_aliases: List[str]) -> set:
         return set()
     result = set()
     for r in range(header_row + 1, sheet.max_row + 1):
-        pid = normalize_id(sheet.cell(r, id_col).value)
-        if pid and is_valid_tw_id(pid):
+        pid = _source_person_id(sheet, r, sheet.cell(r, id_col).value)
+        if pid:
             result.add(pid)
     return result
 
@@ -4467,7 +4590,7 @@ def _find_sheet_id_col(sheet: Any, id_aliases: List[str], search_rows: int = 10)
 
 
 def _normalize_match_name(value: Any) -> str:
-    return clean_spaces(value).upper()
+    return normalize_member_name(value).upper()
 
 
 def _bday_match_token(value: Any) -> Optional[str]:
@@ -4626,6 +4749,60 @@ def build_member_key_set_from_sources(
     return result
 
 
+def build_member_key_order_from_source(
+    all_members: Dict[str, Dict[str, Any]],
+    sheet: Any,
+    id_aliases: List[str],
+) -> List[str]:
+    if sheet is None:
+        return []
+
+    ordered: List[str] = []
+    seen: set[str] = set()
+    id_col, header_row = _find_sheet_id_col(sheet, id_aliases, search_rows=10)
+
+    def add_pid(pid: str) -> None:
+        if pid and pid in all_members and pid not in seen:
+            ordered.append(pid)
+            seen.add(pid)
+
+    if id_col is not None:
+        for r in range(header_row + 1, sheet.max_row + 1):
+            pid = _source_person_id(sheet, r, sheet.cell(r, id_col).value)
+            add_pid(pid)
+
+    match_rows = _iter_source_match_rows(sheet, id_aliases)
+    if match_rows:
+        name_bday_map, name_phone_map, name_only_map = _build_member_match_maps(all_members)
+        for row_name, row_bday, row_phones in match_rows:
+            matched_ids = _match_source_row_to_member_ids(
+                row_name,
+                row_bday,
+                row_phones,
+                name_bday_map,
+                name_phone_map,
+                name_only_map,
+            )
+            if matched_ids and len(matched_ids) == 1:
+                add_pid(next(iter(matched_ids)))
+    return ordered
+
+
+def build_member_key_order_from_sources(
+    all_members: Dict[str, Dict[str, Any]],
+    sheets: List[Any],
+    id_aliases: List[str],
+) -> List[str]:
+    ordered: List[str] = []
+    seen: set[str] = set()
+    for sheet in sheets:
+        for pid in build_member_key_order_from_source(all_members, sheet, id_aliases):
+            if pid not in seen:
+                ordered.append(pid)
+                seen.add(pid)
+    return ordered
+
+
 def build_ascvd_member_id_set(sheet: Any, id_aliases: List[str]) -> set:
     """從會員名單抓 ID set，作為沒有獨立 ASCVD sheet 時的 114 名單來源。"""
     if sheet is None:
@@ -4639,8 +4816,8 @@ def build_ascvd_member_id_set(sheet: Any, id_aliases: List[str]) -> set:
         return set()
     result = set()
     for r in range(header_row + 1, sheet.max_row + 1):
-        pid = normalize_id(sheet.cell(r, id_col).value)
-        if pid and is_valid_tw_id(pid):
+        pid = _source_person_id(sheet, r, sheet.cell(r, id_col).value)
+        if pid:
             result.add(pid)
     return result
 
@@ -5293,7 +5470,7 @@ def _fill_member_basic(
         clinic = info.get("clinic") or clinic_val
         age    = calc_age(bday, now) if isinstance(bday, datetime.date) else -1
         sex    = infer_gender_from_id(pid)
-        output_pid = pid if is_valid_tw_id(pid) else None
+        output_pid = None if str(pid).startswith("__NOID__") else pid
 
         safe_set(ws, out_r, _c_clinic,  clinic)
         safe_set(ws, out_r, _c_name,    name or None)
@@ -5799,6 +5976,17 @@ def load_source(
     )
     sh_p4p_enroll = _first_sheet(wb_src, "P4P收案", "收案管理", "P4pCase")
     sh_p4p_track = _first_sheet(wb_src, "P4P追蹤", "追蹤管理", "P4pTrack")
+    sh_self_select = _first_sheet(wb_src, "自選會員", "自選名單")
+    self_select_order = build_member_key_order_from_sources(
+        all_members,
+        [sheet for sheet in (
+            sh_self_select,
+            _first_sheet(wb_src, "自選名單115"),
+        ) if sheet is not None],
+        ["身份證號", "身份證號碼", "身分證號", "身分證號碼", "ID", "家醫收案會員ID"],
+    )
+    if self_select_order:
+        _log(f"自選名單來源順序：{len(self_select_order)} 筆")
     sh_115_designated = _first_sheet(wb_src, "115指定會員")
     designated_115_source_ids = build_id_set(
         sh_115_designated,
@@ -5826,7 +6014,7 @@ def load_source(
         sh_health=_require_sheet(wb_src, "HealthCase", "健康管理列表", "個案健康管理列表"),
         sh_main_sub_dx=_first_sheet(wb_src, "主次診斷", "主次診段"),
         sh_phone=_first_sheet(wb_src, "行動電話", "基本資料檔列印"),
-        sh_self_select=_first_sheet(wb_src, "自選會員", "自選名單"),
+        sh_self_select=sh_self_select,
         sh_115x=_first_sheet(wb_src, "115X"),
         sh_115_designated=sh_115_designated,
         sh_p4p_enroll=sh_p4p_enroll,
@@ -5845,6 +6033,7 @@ def load_source(
         designated_115_source_count=len(designated_115_source_ids),
         designated_115_ids=designated_115_ids,
         designated_115_details=designated_115_details,
+        self_select_order=self_select_order,
     )
 
 
@@ -6049,6 +6238,7 @@ def compute_kpis(
         all_members=source_ctx.all_members if source_ctx is not None else None,
         designated_115_ids=source_ctx.designated_115_ids if source_ctx is not None else None,
         designated_115_details=source_ctx.designated_115_details if source_ctx is not None else None,
+        preferred_id_order=source_ctx.self_select_order if source_ctx is not None else None,
     )
     if source_ctx:
         _log("產生自選名單工作表")
@@ -6059,6 +6249,7 @@ def compute_kpis(
             data_start,
             last_row,
             source_ctx.sh_self_select,
+            preferred_id_order=source_ctx.self_select_order,
         )
 
 

@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-耀聖系統前置清洗 + 共用核心包裝（0611）
+耀聖系統前置清洗 + 共用核心包裝（0618）
 
 用途：
 - 耀聖 HIS 的 最後就診日.CSV 只有病歷號/姓名/生日，無身分證號。
   本程式掃描來源資料夾建立 姓名+生日 → 身分證 對照表，
   將最後就診日轉為含 ID 的標準格式，供共用核心填入 K 欄（最後就診日）。
 - 次數/ 資料夾的月份 CSV 同樣用對照表補齊 ID。
+- 預防保健名單.CSV：
+  - 結束日/就診日作為各類預防保健的檢查日期。
+  - 預防保健/卡序依 IC 代碼分流至成健/BC肝/子抹/糞篩/老流。
+  - 主次代碼/ICD 彙整為主次診斷代碼。
 - R11440 資料夾等已含 ID 的原始檔案直接交給共用核心，不另行處理。
 - 自動偵測日期最新的選會員共用核心與模板完成輸出。
 - 不包「新耀聖」（另有 前置清洗_新耀聖_*.py）。
@@ -16,6 +20,7 @@ from __future__ import annotations
 
 import csv
 import datetime
+import hashlib
 import importlib.util
 import os
 import re
@@ -30,6 +35,20 @@ from openpyxl import Workbook, load_workbook
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+SCREENING_CODE_MAP = {
+    "IC3E": ("成人健檢",),
+    "IC23": ("成人健檢",),
+    "IC24": ("成人健檢",),
+    "IC29": ("肝炎篩檢",),
+    "IC31": ("子宮抹片",),
+    "IC37": ("子宮抹片",),
+    "IC85": ("糞便潛血",),
+    "IC01": ("老人流感",),
+    "ICL1001": ("成人健檢", "肝炎篩檢"),
+    "ICL1002": ("成人健檢", "肝炎篩檢"),
+}
+SCREENING_SHEETS = ("成人健檢", "子宮抹片", "糞便潛血", "老人流感", "肝炎篩檢")
 
 
 # ─── 共用核心自動偵測 ─────────────────────────────────────────────────────────
@@ -128,6 +147,16 @@ def _find_header_row(
 _ID_RE = re.compile(r"^[A-Z]{1,2}\d{8,9}$")
 
 
+def _valid_pid(value: Any) -> str:
+    pid = re.sub(r"\s+", "", str(value or "").strip().upper())
+    return pid if _ID_RE.fullmatch(pid) else ""
+
+
+def _internal_id(seed: str) -> str:
+    number = int(hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12], 16) % 1_000_000_000
+    return f"Z{number:09d}"
+
+
 # ─── 身分證對照表 ─────────────────────────────────────────────────────────────
 
 def _infer_name_col(rows: List[List], h: int, id_col: int, bday_col: int) -> Optional[int]:
@@ -193,6 +222,218 @@ def build_identity_map(source_dir: Path) -> Dict[Tuple[str, str], str]:
         except Exception:
             continue
     return mapping
+
+
+# ─── 預防保健 CSV 轉換 ───────────────────────────────────────────────────────
+
+def _merge_prevention_identity_map(
+    source_dir: Path,
+    identity_map: Dict[Tuple[str, str], str],
+) -> int:
+    path = source_dir / "預防保健名單.CSV"
+    if not path.exists():
+        path = source_dir / "預防保健名單.csv"
+    if not path.exists():
+        return 0
+
+    rows = _read_csv_rows(path)
+    h = _find_header_row(
+        rows,
+        (
+            ("結束日", "就診日"),
+            ("姓名",),
+            ("生日",),
+            ("身份證號", "身分證號"),
+            ("預防保健", "卡序"),
+            ("主次代碼", "ICD"),
+        ),
+    )
+    if h is None:
+        raise ValueError("預防保健名單找不到結束日/姓名/生日/身分證/預防保健/主次代碼必要欄位")
+    header = rows[h]
+    name_col = _find_col(header, ("姓名",))
+    bday_col = _find_col(header, ("生日",))
+    id_col = _find_col(header, ("身份證號", "身分證號"))
+    added = 0
+    for row in rows[h + 1:]:
+        name = _normalize_name(row[name_col] if name_col is not None and name_col < len(row) else "")
+        bday = _parse_date_iso(row[bday_col] if bday_col is not None and bday_col < len(row) else "")
+        pid = _valid_pid(row[id_col] if id_col is not None and id_col < len(row) else "")
+        if not name or not bday or not pid:
+            continue
+        key = (name, bday)
+        existing = identity_map.get(key)
+        if existing and existing != pid:
+            raise ValueError(f"預防保健姓名生日對應多個 ID：{name} / {bday}")
+        if not existing:
+            identity_map[key] = pid
+            added += 1
+    return added
+
+
+def _extend_identity_map_with_internal_ids(
+    source_dir: Path,
+    identity_map: Dict[Tuple[str, str], str],
+) -> set[str]:
+    keys: set[Tuple[str, str]] = set()
+    csv_paths = (
+        sorted(source_dir.glob("最後就診日*.CSV"))
+        + sorted(source_dir.glob("最後就診日*.csv"))
+    )
+    count_dir = source_dir / "次數"
+    if count_dir.is_dir():
+        csv_paths.extend(sorted(count_dir.glob("*.CSV")))
+        csv_paths.extend(sorted(count_dir.glob("*.csv")))
+
+    for path in csv_paths:
+        rows = _read_csv_rows(path)
+        h = _find_header_row(rows, (("姓名", "姓    名", "病患姓名"), ("生日", "生   日")))
+        if h is None:
+            continue
+        name_col = _find_col(rows[h], ("姓名", "病患姓名", "姓    名"))
+        bday_col = _find_col(rows[h], ("生日", "生   日"))
+        for row in rows[h + 1:]:
+            name = _normalize_name(row[name_col] if name_col is not None and name_col < len(row) else "")
+            bday = _parse_date_iso(row[bday_col] if bday_col is not None and bday_col < len(row) else "")
+            if name and bday:
+                keys.add((name, bday))
+
+    internal_ids: set[str] = set()
+    used_ids = set(identity_map.values())
+    seed_base = source_dir.name
+    for name, bday in sorted(keys):
+        key = (name, bday)
+        if key in identity_map:
+            continue
+        salt = 0
+        while True:
+            pid = _internal_id(f"{seed_base}|{name}|{bday}|{salt}")
+            if pid not in used_ids:
+                break
+            salt += 1
+        identity_map[key] = pid
+        used_ids.add(pid)
+        internal_ids.add(pid)
+    return internal_ids
+
+
+def _convert_prevention_csv(source_dir: Path, out_dir: Path) -> Dict[str, int]:
+    path = source_dir / "預防保健名單.CSV"
+    if not path.exists():
+        path = source_dir / "預防保健名單.csv"
+    if not path.exists():
+        raise FileNotFoundError("找不到預防保健名單.CSV")
+
+    rows = _read_csv_rows(path)
+    h = _find_header_row(
+        rows,
+        (
+            ("結束日", "就診日"),
+            ("姓名",),
+            ("生日",),
+            ("身份證號", "身分證號"),
+            ("預防保健", "卡序"),
+            ("主次代碼", "ICD"),
+        ),
+    )
+    if h is None:
+        raise ValueError("預防保健名單找不到結束日/姓名/生日/身分證/預防保健/主次代碼必要欄位")
+    header = rows[h]
+    end_date_col = _find_col(header, ("結束日", "就診日"))
+    name_col = _find_col(header, ("姓名",))
+    bday_col = _find_col(header, ("生日",))
+    id_col = _find_col(header, ("身份證號", "身分證號"))
+    prevention_col = _find_col(header, ("預防保健", "卡序"))
+    primary_secondary_col = _find_col(header, ("主次代碼", "ICD"))
+
+    screening: Dict[str, Dict[str, Tuple[str, str, str]]] = {
+        sheet_name: {} for sheet_name in SCREENING_SHEETS
+    }
+    dx_codes: Dict[str, Dict[str, Any]] = {}
+    selected_rows = 0
+    skipped_codes = 0
+
+    for row in rows[h + 1:]:
+        pid = _valid_pid(row[id_col] if id_col is not None and id_col < len(row) else "")
+        if not pid:
+            continue
+        name = str(row[name_col] if name_col is not None and name_col < len(row) else "").strip()
+        bday = _parse_date_iso(row[bday_col] if bday_col is not None and bday_col < len(row) else "")
+        screening_date = _parse_date_iso(
+            row[end_date_col] if end_date_col is not None and end_date_col < len(row) else ""
+        )
+        prevention_code = re.sub(
+            r"\s+",
+            "",
+            str(
+                row[prevention_col]
+                if prevention_col is not None and prevention_col < len(row)
+                else ""
+            ),
+        ).upper()
+        primary_secondary_code = str(
+            row[primary_secondary_col]
+            if primary_secondary_col is not None and primary_secondary_col < len(row)
+            else ""
+        ).strip()
+
+        if primary_secondary_code:
+            rec = dx_codes.setdefault(pid, {"name": name, "birth": bday, "codes": []})
+            if primary_secondary_code not in rec["codes"]:
+                rec["codes"].append(primary_secondary_code)
+
+        kinds = SCREENING_CODE_MAP.get(prevention_code, ())
+        if not kinds:
+            skipped_codes += 1
+            continue
+        if not screening_date:
+            continue
+        selected_rows += 1
+        for kind in kinds:
+            existing = screening[kind].get(pid)
+            if existing is None or screening_date > existing[0]:
+                screening[kind][pid] = (screening_date, name, bday)
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    for sheet_name in SCREENING_SHEETS:
+        ws = wb.create_sheet(sheet_name)
+        ws.append(["ID", "姓名", "生日", "最後篩檢日期"])
+        for pid, (last_date, name, bday) in sorted(screening[sheet_name].items()):
+            ws.append([pid, name, bday, last_date])
+    wb.save(out_dir / "耀聖_預防保健_補正.xlsx")
+    wb.close()
+
+    wb_dx = Workbook()
+    ws_dx = wb_dx.active
+    ws_dx.title = "主次診斷"
+    ws_dx.append(["ID", "姓名", "生日", "診斷代碼"])
+    for pid, rec in sorted(dx_codes.items()):
+        ws_dx.append([pid, rec["name"], rec["birth"], ",".join(rec["codes"])])
+    wb_dx.save(out_dir / "耀聖_主次診斷_補正.xlsx")
+    wb_dx.close()
+
+    wb_health = Workbook()
+    ws_health = wb_health.active
+    ws_health.title = "HealthCase"
+    ws_health.append([
+        "家醫收案會員ID", "姓名", "生日",
+        "最近一次HbA1c檢查結果(%)", "最近一次HbA1c檢查日期",
+        "最近一次LDL檢查結果(mg/dL)", "最近一次LDL檢查日期",
+        "最近一次UACR檢查結果(mg/gm)", "最近一次UACR檢查日期",
+    ])
+    wb_health.save(out_dir / "耀聖_HealthCase_空白.xlsx")
+    wb_health.close()
+
+    path.unlink(missing_ok=True)
+    return {
+        "source_rows": max(len(rows) - h - 1, 0),
+        "selected_rows": selected_rows,
+        "selected_people": len({pid for values in screening.values() for pid in values}),
+        "dx_people": len(dx_codes),
+        "skipped_codes": skipped_codes,
+        **{sheet: len(values) for sheet, values in screening.items()},
+    }
 
 
 # ─── 最後就診日.CSV 轉換 ──────────────────────────────────────────────────────
@@ -400,6 +641,89 @@ def _post_fill_last_visit(output_path: Path, last_visit_dict: Dict[str, str]) ->
     wb.close()
 
 
+def _blank_internal_ids(output_path: Path, internal_ids: set[str]) -> int:
+    if not internal_ids:
+        return 0
+    wb = load_workbook(output_path)
+    changed = 0
+    try:
+        id_headers = {
+            "ID", "身份證號", "身分證號", "身份證號碼", "身分證號碼", "家醫收案會員ID"
+        }
+        for ws in wb.worksheets:
+            id_columns: set[int] = set()
+            header_limit = min(10, ws.max_row)
+            for row in range(1, header_limit + 1):
+                for col in range(1, ws.max_column + 1):
+                    if str(ws.cell(row, col).value or "").strip() in id_headers:
+                        id_columns.add(col)
+            for col in id_columns:
+                for row in range(1, ws.max_row + 1):
+                    pid = str(ws.cell(row, col).value or "").strip().upper()
+                    if pid in internal_ids:
+                        ws.cell(row, col).value = None
+                        changed += 1
+        if changed:
+            wb.save(output_path)
+        return changed
+    finally:
+        wb.close()
+
+
+def _post_fill_main_dx(output_path: Path, source_dir: Path) -> int:
+    path = source_dir / "預防保健名單.CSV"
+    if not path.exists():
+        path = source_dir / "預防保健名單.csv"
+    if not path.exists():
+        return 0
+    rows = _read_csv_rows(path)
+    h = _find_header_row(rows, (("身份證號", "身分證號"), ("ICD", "主次代碼")))
+    if h is None:
+        return 0
+    id_col = _find_col(rows[h], ("身份證號", "身分證號"))
+    dx_col = _find_col(rows[h], ("ICD", "主次代碼"))
+    dx_map: Dict[str, List[str]] = {}
+    for row in rows[h + 1:]:
+        pid = _valid_pid(row[id_col] if id_col is not None and id_col < len(row) else "")
+        dx = str(row[dx_col] if dx_col is not None and dx_col < len(row) else "").strip()
+        if not pid or not dx:
+            continue
+        bucket = dx_map.setdefault(pid, [])
+        if dx not in bucket:
+            bucket.append(dx)
+
+    wb = load_workbook(output_path)
+    changed = 0
+    try:
+        if "會員總表" not in wb.sheetnames:
+            return 0
+        ws = wb["會員總表"]
+        id_col_out = None
+        dx_col_out = None
+        for col in range(1, ws.max_column + 1):
+            header = str(ws.cell(1, col).value or "").replace("\n", "").strip()
+            if header in ("身份證號碼", "身分證號碼", "身份證號", "身分證號", "ID"):
+                id_col_out = col
+            if "病123" in header:
+                dx_col_out = col
+        if id_col_out is None or dx_col_out is None:
+            return 0
+        for row in range(3, ws.max_row + 1):
+            pid = str(ws.cell(row, id_col_out).value or "").strip().upper()
+            codes = dx_map.get(pid)
+            if not codes:
+                continue
+            value = ",".join(codes)
+            if ws.cell(row, dx_col_out).value != value:
+                ws.cell(row, dx_col_out).value = value
+                changed += 1
+        if changed:
+            wb.save(output_path)
+        return changed
+    finally:
+        wb.close()
+
+
 # ─── 主流程 ──────────────────────────────────────────────────────────────────
 
 def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
@@ -423,13 +747,39 @@ def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
             list(temp_source.glob("最後就診日*.csv"))
         )
         has_count_dir = (temp_source / "次數").is_dir()
+        has_prevention = (
+            (temp_source / "預防保健名單.CSV").exists()
+            or (temp_source / "預防保健名單.csv").exists()
+        )
 
         matched = 0
         last_visit_dict: Dict[str, str] = {}
-        if has_last_visit or has_count_dir:
+        internal_ids: set[str] = set()
+        if has_last_visit or has_count_dir or has_prevention:
             print("建立姓名+生日 → ID 對照表…", flush=True)
             identity_map = build_identity_map(temp_source)
+            if has_prevention:
+                prevention_ids = _merge_prevention_identity_map(temp_source, identity_map)
+                print(f"  預防保健新增 ID 對照：{prevention_ids} 筆", flush=True)
+            internal_ids = _extend_identity_map_with_internal_ids(temp_source, identity_map)
+            if internal_ids:
+                print(f"  無真實 ID，暫以內部 ID 串接：{len(internal_ids)} 人", flush=True)
             print(f"  對照表：{len(identity_map)} 筆", flush=True)
+            if has_prevention:
+                prevention_stats = _convert_prevention_csv(temp_source, temp_source)
+                print(
+                    "  預防保健："
+                    f"來源 {prevention_stats['source_rows']} 筆；"
+                    f"指定代碼 {prevention_stats['selected_rows']} 筆／"
+                    f"{prevention_stats['selected_people']} 人；"
+                    f"成健 {prevention_stats['成人健檢']}、"
+                    f"BC肝 {prevention_stats['肝炎篩檢']}、"
+                    f"子抹 {prevention_stats['子宮抹片']}、"
+                    f"糞篩 {prevention_stats['糞便潛血']}、"
+                    f"老流 {prevention_stats['老人流感']}；"
+                    f"主次診斷 {prevention_stats['dx_people']} 人",
+                    flush=True,
+                )
             if has_last_visit:
                 count, last_visit_dict = _convert_last_visit_csv(temp_source, identity_map, temp_source)
                 matched += count
@@ -439,6 +789,12 @@ def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
 
         temp_output = Path(generic.process_excel(str(temp_source), template))
         _post_fill_last_visit(temp_output, last_visit_dict)
+        dx_count = _post_fill_main_dx(temp_output, source_dir)
+        if dx_count:
+            print(f"  主次診斷原始欄位回填：{dx_count} 人", flush=True)
+        blanked_ids = _blank_internal_ids(temp_output, internal_ids)
+        if blanked_ids:
+            print(f"  已清空暫時內部 ID：{blanked_ids} 格", flush=True)
         final_output = source_dir.parent / temp_output.name
         if final_output.exists():
             final_output.unlink()
