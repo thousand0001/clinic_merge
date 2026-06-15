@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-方鼎前置清洗 + 通用主程式包裝
+方鼎前置清洗 + 最新共用核心包裝（0616）
 
-目前方鼎資料格式已可直接交給通用版，
-這支前置器先作為模組化入口，後續若有格式差異再往這裡收。
+保留方鼎 XLS 相容、月份檔名與姓名補 ID 規則，
+自選／不選會員交由最新共用核心依通用 E1/E2 規則處理。
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import re
@@ -23,19 +24,19 @@ from typing import Any, Dict, List, Optional, Tuple
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-def _find_generic_script(script_dir: Path) -> Path:
-    candidates = sorted(script_dir.glob("run_merge_通用_*.py"), reverse=True)
+def _find_common_core(script_dir: Path) -> Path:
+    candidates = sorted(script_dir.glob("選會員_共用核心_*.py"), reverse=True)
     if not candidates:
-        raise RuntimeError("找不到通用程式 run_merge_通用_*.py")
+        raise RuntimeError("找不到共用核心：選會員_共用核心_*.py")
     return candidates[0]
 
-GENERIC_SCRIPT = _find_generic_script(SCRIPT_DIR)
+COMMON_CORE = _find_common_core(SCRIPT_DIR)
 
 
-def _load_generic_module():
-    spec = importlib.util.spec_from_file_location("run_merge_generic", GENERIC_SCRIPT)
+def _load_common_core():
+    spec = importlib.util.spec_from_file_location("fangding_common_core", COMMON_CORE)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"無法載入通用程式：{GENERIC_SCRIPT}")
+        raise RuntimeError(f"無法載入共用核心：{COMMON_CORE}")
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
@@ -55,10 +56,14 @@ class FangdingMonthlyClaimSheetScan:
     month: Optional[int]
 
 
-GENERIC = _load_generic_module()
+GENERIC = _load_common_core()
 
 
 class FangdingProfile(GENERIC.ProcessingProfile):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.claim_fee_months_115: List[int] = []
 
     def load_xls_as_workbook(self, xls_path: str):
         # 方鼎匯出的 .xls 檔有時實際上是 xlsx 格式，xlrd 無法讀取，需改用 openpyxl。
@@ -203,7 +208,8 @@ class FangdingProfile(GENERIC.ProcessingProfile):
                 member_name_to_ids.setdefault(name, []).append(pid)
 
         out: Dict[str, Dict[str, float]] = {}
-        seen_115_months: set = set()
+        seen_115_count_months: set = set()
+        seen_115_fee_months: set = set()
         scans = monthly_scans or {
             sheet_name: scan
             for sheet_name in wb_src.sheetnames
@@ -212,7 +218,8 @@ class FangdingProfile(GENERIC.ProcessingProfile):
 
         for sheet_name, scan in scans.items():
             sh = wb_src[sheet_name]
-            matched_any_115 = False
+            matched_any_115_count = False
+            matched_any_115_fee = False
             for r in range(scan.header_row + 1, sh.max_row + 1):
                 pid = ""
                 if scan.id_col:
@@ -251,27 +258,36 @@ class FangdingProfile(GENERIC.ProcessingProfile):
 
                 prefix = str(year_bucket)
                 if cnt is not None:
+                    month_key = GENERIC._claim_month_key(year_bucket, "cnt", month)
+                    bucket[month_key] = bucket.get(month_key, 0.0) + cnt
                     if year_bucket == 115:
                         bucket["115_cnt"] += cnt
                         if is_q1:
                             bucket["115_cnt_q1"] += cnt
+                            matched_any_115_count = True
                     elif is_q1:
                         bucket[f"{prefix}_cnt"] += cnt
                     if year_bucket == 114:
                         bucket["114_cnt_full"] += cnt
                 if amt is not None:
+                    month_key = GENERIC._claim_month_key(year_bucket, "amt", month)
+                    bucket[month_key] = bucket.get(month_key, 0.0) + amt
                     if is_q1:
                         bucket[f"{prefix}_amt"] += amt
+                        if year_bucket == 115:
+                            matched_any_115_fee = True
                     bucket[f"{prefix}_amt_total"] += amt
-                if year_bucket == 115 and is_q1 and (cnt is not None or amt is not None):
-                    matched_any_115 = True
-            if matched_any_115 and scan.month is not None:
-                seen_115_months.add(scan.month)
+            if scan.month is not None:
+                if matched_any_115_count:
+                    seen_115_count_months.add(scan.month)
+                if matched_any_115_fee:
+                    seen_115_fee_months.add(scan.month)
 
-        month_count_115 = float(len(seen_115_months))
+        self.claim_fee_months_115 = sorted(seen_115_fee_months)
+        fee_month_count_115 = float(len(seen_115_fee_months))
         for bucket in out.values():
-            bucket["115_months"] = month_count_115
-        return out, sorted(seen_115_months)
+            bucket["115_months"] = fee_month_count_115
+        return out, sorted(seen_115_count_months)
 
 
 def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
@@ -279,29 +295,112 @@ def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
     template = template_path or GENERIC._find_template(str(SCRIPT_DIR))
     if not os.path.exists(template):
         raise ValueError(f"找不到模板檔：{template}")
-    return GENERIC.process_excel(source_path, template, profile=profile)
+
+    original_populate_doctor_sheet = GENERIC.populate_doctor_sheet
+    original_months_summary = GENERIC._format_115_months_summary
+    original_supplement_claim_counts = GENERIC._supplement_claim_counts_from_hisb
+
+    def supplement_claim_counts_with_fee_months(*args: Any, **kwargs: Any):
+        claim_sums, count_months = original_supplement_claim_counts(*args, **kwargs)
+        fee_month_count = float(len(profile.claim_fee_months_115))
+        for bucket in claim_sums.values():
+            bucket["115_months"] = fee_month_count
+        return claim_sums, count_months
+
+    def populate_doctor_sheet_with_fee_months(*args: Any, **kwargs: Any) -> None:
+        original_populate_doctor_sheet(*args, **kwargs)
+        wb_tpl = args[0]
+        fee_months = profile.claim_fee_months_115
+        if GENERIC.DOCTOR_SHEET_NAME not in wb_tpl.sheetnames:
+            return
+        ws_doc = wb_tpl[GENERIC.DOCTOR_SHEET_NAME]
+        if fee_months:
+            month_text = GENERIC._format_month_span(fee_months)
+            ws_doc["O2"] = (
+                f"115年{month_text}\n月平均費用\n"
+                f"（實際費用月份總額 ÷ {len(fee_months)}）"
+            )
+        else:
+            ws_doc["O2"] = "115年月平均費用\n（未偵測到費用月份）"
+
+    def format_months_summary(count_months: List[int]) -> str:
+        count_text = (
+            f"{GENERIC._format_month_span(count_months)}，共{len(count_months)}個月"
+            if count_months
+            else "未偵測到月份資料"
+        )
+        fee_months = profile.claim_fee_months_115
+        fee_text = (
+            f"{GENERIC._format_month_span(fee_months)}，共{len(fee_months)}個月"
+            if fee_months
+            else "未偵測到費用月份"
+        )
+        return (
+            f"115年次數月份：{count_text}；醫生看 L/M 欄依次數月份統計。"
+            f"115年費用月份：{fee_text}；醫生看 O 欄依費用月份計算月平均。"
+        )
+
+    GENERIC.populate_doctor_sheet = populate_doctor_sheet_with_fee_months
+    GENERIC._format_115_months_summary = format_months_summary
+    GENERIC._supplement_claim_counts_from_hisb = supplement_claim_counts_with_fee_months
+    try:
+        return GENERIC.process_excel(source_path, template, profile=profile)
+    finally:
+        GENERIC.populate_doctor_sheet = original_populate_doctor_sheet
+        GENERIC._format_115_months_summary = original_months_summary
+        GENERIC._supplement_claim_counts_from_hisb = original_supplement_claim_counts
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> int:
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
-    root = tk.Tk()
-    root.withdraw()
+    parser = argparse.ArgumentParser(description="方鼎前置清洗與選會員輸出")
+    parser.add_argument("source_dir", nargs="?", help="來源資料夾；未指定時開啟選擇視窗")
+    parser.add_argument("--no-open", action="store_true", help="完成後不自動開啟 Excel")
+    parser.add_argument("--no-dialog", action="store_true", help="完成後不顯示完成視窗")
+    args = parser.parse_args(argv)
 
-    src = filedialog.askdirectory(title="選擇方鼎來源資料夾")
+    root = None
+    src = args.source_dir
     if not src:
-        return
+        root = tk.Tk()
+        root.withdraw()
+        src = filedialog.askdirectory(title="選擇方鼎來源資料夾")
+    if not src:
+        if root is not None:
+            root.destroy()
+        print("未選擇來源資料夾，程式已取消。")
+        return 0
+    src = str(Path(src).expanduser().resolve())
+    if not os.path.isdir(src):
+        raise FileNotFoundError(f"找不到來源資料夾：{src}")
 
     template = GENERIC._find_template(str(SCRIPT_DIR))
 
     try:
         out = process_excel(src, template)
-        messagebox.showinfo("完成", f"已輸出：\n{out}")
-        GENERIC.open_file_cross_platform(out)
+        print(f"完成：{out}")
+        if not args.no_dialog:
+            if root is None:
+                root = tk.Tk()
+                root.withdraw()
+            messagebox.showinfo("完成", f"已輸出：\n{out}", parent=root)
+        if not args.no_open:
+            GENERIC.open_file_cross_platform(out)
     except Exception as e:
-        messagebox.showerror("錯誤", str(e))
+        print(f"錯誤：{e}")
+        if not args.no_dialog:
+            if root is None:
+                root = tk.Tk()
+                root.withdraw()
+            messagebox.showerror("錯誤", str(e), parent=root)
+        return 2
+    finally:
+        if root is not None:
+            root.destroy()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

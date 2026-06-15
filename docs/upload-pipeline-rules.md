@@ -1,6 +1,7 @@
 # 資料上傳流程規則
 
-> 根據 2026-06-10 稽核結論制定。目前僅為規則，尚未全部實作。
+> 根據 2026-06-10 稽核結論制定，並於 2026-06-12 依目前程式狀態校正。
+> 規則尚未全部實作；各項狀態以本文件與測試結果為準。
 
 ---
 
@@ -33,7 +34,9 @@
   1. 舊批次 `status` 更新為 `superseded`
   2. 新批次寫入 `current` 層（或設為 active）
   3. 舊批次資料保留 history，不刪除（供回復用）
-- 目前 writer 只刪除相同 `batch_id` 的資料，**不會標記舊批次 superseded**，待修
+- `db_pipeline/storage/__init__.py` 已在同一 transaction 內將同診所舊的
+  `validated/published` 批次標記為 `superseded`，再把新批次設為 `validated`。
+- **待補**：專門單元測試與 PostgreSQL 實例驗證，確認失敗 transaction 不會改變舊批次狀態。
 
 ---
 
@@ -58,15 +61,22 @@
 |------|------|--------|
 | raw 7,616 組重複，多 8,852 列 | raw.uploaded_rows | 中（稽核用可接受） |
 | staging.members 最新批次多 2,211 筆（鈞安 1,283、崇恩 928） | staging | 高 |
-| 新批次不標記舊批次 superseded | storage/__init__.py L466 | 高 |
 | 同會員多筆採第一非空值，不分新舊 | member_builder.py L59 | 中 |
 | .xls/.pdf 未展開欄位內容 | collector.py L102 | 低 |
+
+已完成但待驗證：
+
+| 項目 | 實作位置 | 尚缺 |
+|------|----------|------|
+| 新批次驗證成功後標記舊批次 `superseded` | `db_pipeline/storage/__init__.py` | 專門單元測試、DB transaction 驗證 |
 
 ---
 
 ## 測試規則
 
-- 現有 30 項測試通過，但未覆蓋：
+- 2026-06-12 使用 Python 3.9 執行現有測試：30 項通過，另 1 個測試因環境缺少
+  `xlrd` 在匯入階段中止，未出現功能斷言失敗。
+- 仍未覆蓋：
   - 跨檔去重
   - 新批次蓋舊批次
   - 完整欄位上傳
