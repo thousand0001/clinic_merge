@@ -17,6 +17,7 @@ import datetime
 import re
 import sys
 import tkinter as tk
+import unicodedata
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -176,6 +177,55 @@ def format_member_errors(
     if len(errors) > limit:
         lines.append(f"另有 {len(errors) - limit} 筆未列出。")
     return "\n".join(lines)
+
+
+def garbled_name_reason(value) -> str:
+    """回傳姓名中確定不適合 CP950 上傳的原因；正常時回傳空字串。"""
+    name = "" if value is None else str(value).strip()
+    if not name:
+        return "姓名為空白"
+    problems: list[str] = []
+    for char in name:
+        codepoint = f"U+{ord(char):04X}"
+        if char in {"�", "?", "？"}:
+            problems.append(f"疑似替代字元 {char!r}（{codepoint}）")
+            continue
+        if unicodedata.category(char) in {"Co", "Cs"}:
+            problems.append(f"私用區字元（{codepoint}）")
+            continue
+        try:
+            char.encode("cp950")
+        except UnicodeEncodeError:
+            problems.append(f"CP950 無法編碼字元 {char!r}（{codepoint}）")
+    return "、".join(dict.fromkeys(problems))
+
+
+def filter_garbled_names(members: list[dict]) -> tuple[list[dict], list[dict]]:
+    """排除姓名含確定亂碼的會員，並保留摘要所需資訊。"""
+    accepted: list[dict] = []
+    excluded: list[dict] = []
+    for member in members:
+        reason = garbled_name_reason(member.get("name"))
+        if reason:
+            excluded.append({
+                "pid": member.get("pid", ""),
+                "name": member.get("name", ""),
+                "reason": reason,
+            })
+        else:
+            accepted.append(member)
+    return accepted, excluded
+
+
+def format_garbled_summary(errors: list[dict], limit: int = 10) -> list[str]:
+    lines = [f"亂碼姓名排除：{len(errors)} 筆"]
+    for item in errors[:limit]:
+        lines.append(
+            f"{item['pid'] or 'ID空白'}｜{item['name'] or '姓名空白'}｜{item['reason']}"
+        )
+    if len(errors) > limit:
+        lines.append(f"另有 {len(errors) - limit} 筆未列出。")
+    return lines
 
 
 def make_record(
@@ -621,11 +671,12 @@ class UploadApp:
             case_type  = CASE_SELF
             label_type = "自選會員"
             members = self_members
+            garbled_name_errors: list[dict] = []
         else:
             subfolder  = DESIGNATED_SUBFOLDER
             case_type  = CASE_DESIGNATED
             label_type = "指定會員"
-            members = designated_members
+            members, garbled_name_errors = filter_garbled_names(designated_members)
 
         if skipped_id_errors:
             warning = format_member_errors(
@@ -642,7 +693,9 @@ class UploadApp:
             if mode == "self":
                 msg = "自選會員（AG打勾，扣除不選與指定優先）為 0 筆，未產生輸出。"
             else:
-                msg = "指定會員（AQ打勾且非不選）為 0 筆，未產生輸出。"
+                msg = "指定會員（AQ打勾且非不選，並排除亂碼姓名）為 0 筆，未產生輸出。"
+                if garbled_name_errors:
+                    msg += "\n\n" + "\n".join(format_garbled_summary(garbled_name_errors))
             print(f"[{label_type}] {msg}")
             messagebox.showwarning("無資料", msg)
             return
@@ -678,6 +731,9 @@ class UploadApp:
         else:
             print(f"  AQ 指定勾選：{priority_stats['designated_checked']} 筆")
             print(f"  AF 不選汰除指定：{priority_stats['designated_removed_by_excluded']} 筆")
+            print(f"  亂碼姓名排除：{len(garbled_name_errors)} 筆")
+            for item in garbled_name_errors:
+                print(f"    {item['pid']}｜{item['name']}｜{item['reason']}")
         print(f"  AF 不選總數：{priority_stats['excluded_checked']} 筆")
         print(f"  身分證格式不符跳過：{len(skipped_id_errors)} 筆")
         print(f"  實際輸出：{len(members)} 筆")
@@ -708,6 +764,7 @@ class UploadApp:
                 print(f"AQ 指定優先排除自選：{priority_stats['self_removed_by_designated']} 筆")
             else:
                 print(f"AF 不選汰除指定：{priority_stats['designated_removed_by_excluded']} 筆")
+                print(f"亂碼姓名排除：{len(garbled_name_errors)} 筆")
             print(f"身分證格式不符跳過：{len(skipped_id_errors)} 筆")
             print(f"醫事人員數：{len(valid_prsn)}")
             print(f"輸出檔案數：{len(out_paths)}")
@@ -726,6 +783,7 @@ class UploadApp:
                 summary_lines.append(f"AQ 指定優先排除自選：{priority_stats['self_removed_by_designated']} 筆")
             else:
                 summary_lines.append(f"AF 不選汰除指定：{priority_stats['designated_removed_by_excluded']} 筆")
+                summary_lines.extend(format_garbled_summary(garbled_name_errors))
             summary_lines.append(f"身分證格式不符跳過：{len(skipped_id_errors)} 筆")
             summary_lines += [
                 f"輸出 {len(out_paths)} 份 FM.txt",
