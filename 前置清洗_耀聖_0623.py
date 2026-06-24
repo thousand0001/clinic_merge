@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-耀聖系統前置清洗 + 共用核心包裝（0618）
+耀聖系統前置清洗 + 共用核心包裝（0623）
 
 用途：
 - 耀聖 HIS 的 最後就診日.CSV 只有病歷號/姓名/生日，無身分證號。
   本程式掃描來源資料夾建立 姓名+生日 → 身分證 對照表，
   將最後就診日轉為含 ID 的標準格式，供共用核心填入 K 欄（最後就診日）。
 - 次數/ 資料夾的月份 CSV 同樣用對照表補齊 ID。
-- 預防保健名單.CSV：
+- 預防保健名單.CSV / 預防保健.CSV：
   - 結束日/就診日作為各類預防保健的檢查日期。
   - 預防保健/卡序依 IC 代碼分流至成健/BC肝/子抹/糞篩/老流。
   - 主次代碼/ICD 彙整為主次診斷代碼。
@@ -38,6 +38,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 SCREENING_CODE_MAP = {
     "IC3E": ("成人健檢",),
+    "IC3D": ("成人健檢",),
+    "IC21": ("成人健檢",),
+    "IC22": ("成人健檢",),
     "IC23": ("成人健檢",),
     "IC24": ("成人健檢",),
     "IC29": ("肝炎篩檢",),
@@ -49,6 +52,7 @@ SCREENING_CODE_MAP = {
     "ICL1002": ("成人健檢", "肝炎篩檢"),
 }
 SCREENING_SHEETS = ("成人健檢", "子宮抹片", "糞便潛血", "老人流感", "肝炎篩檢")
+HEPATITIS_LAB_CODES = {"L1001C", "L1002C"}
 
 
 # ─── 共用核心自動偵測 ─────────────────────────────────────────────────────────
@@ -144,6 +148,20 @@ def _find_header_row(
     return None
 
 
+def _find_prevention_csv(source_dir: Path) -> Optional[Path]:
+    """回傳耀聖預防保健 CSV，同時支援新舊檔名。"""
+    for name in (
+        "預防保健名單.CSV",
+        "預防保健名單.csv",
+        "預防保健.CSV",
+        "預防保健.csv",
+    ):
+        path = source_dir / name
+        if path.is_file():
+            return path
+    return None
+
+
 _ID_RE = re.compile(r"^[A-Z]{1,2}\d{8,9}$")
 
 
@@ -230,10 +248,8 @@ def _merge_prevention_identity_map(
     source_dir: Path,
     identity_map: Dict[Tuple[str, str], str],
 ) -> int:
-    path = source_dir / "預防保健名單.CSV"
-    if not path.exists():
-        path = source_dir / "預防保健名單.csv"
-    if not path.exists():
+    path = _find_prevention_csv(source_dir)
+    if path is None:
         return 0
 
     rows = _read_csv_rows(path)
@@ -318,11 +334,9 @@ def _extend_identity_map_with_internal_ids(
 
 
 def _convert_prevention_csv(source_dir: Path, out_dir: Path) -> Dict[str, int]:
-    path = source_dir / "預防保健名單.CSV"
-    if not path.exists():
-        path = source_dir / "預防保健名單.csv"
-    if not path.exists():
-        raise FileNotFoundError("找不到預防保健名單.CSV")
+    path = _find_prevention_csv(source_dir)
+    if path is None:
+        raise FileNotFoundError("找不到預防保健名單.CSV 或 預防保健.CSV")
 
     rows = _read_csv_rows(path)
     h = _find_header_row(
@@ -345,6 +359,7 @@ def _convert_prevention_csv(source_dir: Path, out_dir: Path) -> Dict[str, int]:
     id_col = _find_col(header, ("身份證號", "身分證號"))
     prevention_col = _find_col(header, ("預防保健", "卡序"))
     primary_secondary_col = _find_col(header, ("主次代碼", "ICD"))
+    lab_code_col = _find_col(header, ("檢驗代碼",))
 
     screening: Dict[str, Dict[str, Tuple[str, str, str]]] = {
         sheet_name: {} for sheet_name in SCREENING_SHEETS
@@ -376,13 +391,20 @@ def _convert_prevention_csv(source_dir: Path, out_dir: Path) -> Dict[str, int]:
             if primary_secondary_col is not None and primary_secondary_col < len(row)
             else ""
         ).strip()
+        lab_code = re.sub(
+            r"\s+",
+            "",
+            str(row[lab_code_col] if lab_code_col is not None and lab_code_col < len(row) else ""),
+        ).upper()
 
         if primary_secondary_code:
             rec = dx_codes.setdefault(pid, {"name": name, "birth": bday, "codes": []})
             if primary_secondary_code not in rec["codes"]:
                 rec["codes"].append(primary_secondary_code)
 
-        kinds = SCREENING_CODE_MAP.get(prevention_code, ())
+        kinds = list(SCREENING_CODE_MAP.get(prevention_code, ()))
+        if lab_code in HEPATITIS_LAB_CODES and "肝炎篩檢" not in kinds:
+            kinds.append("肝炎篩檢")
         if not kinds:
             skipped_codes += 1
             continue
@@ -671,10 +693,8 @@ def _blank_internal_ids(output_path: Path, internal_ids: set[str]) -> int:
 
 
 def _post_fill_main_dx(output_path: Path, source_dir: Path) -> int:
-    path = source_dir / "預防保健名單.CSV"
-    if not path.exists():
-        path = source_dir / "預防保健名單.csv"
-    if not path.exists():
+    path = _find_prevention_csv(source_dir)
+    if path is None:
         return 0
     rows = _read_csv_rows(path)
     h = _find_header_row(rows, (("身份證號", "身分證號"), ("ICD", "主次代碼")))
@@ -747,10 +767,7 @@ def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
             list(temp_source.glob("最後就診日*.csv"))
         )
         has_count_dir = (temp_source / "次數").is_dir()
-        has_prevention = (
-            (temp_source / "預防保健名單.CSV").exists()
-            or (temp_source / "預防保健名單.csv").exists()
-        )
+        has_prevention = _find_prevention_csv(temp_source) is not None
 
         matched = 0
         last_visit_dict: Dict[str, str] = {}

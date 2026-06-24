@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -49,7 +50,13 @@ from db_pipeline.parsers.新耀聖 import NewSmParser
 from db_pipeline.validation.models import ValidationIssue
 
 # ── 常數 ──────────────────────────────────────────────────────────────────────
-ID_HEADERS = ("身份證號", "身分證號", "身份證號碼", "身分證號碼", "ID")
+ID_HEADERS = (
+    "ID", "身分證", "身分證號", "身分證號碼", "身分證字號",
+    "身份證", "身份證號", "身份證號碼", "身份證字號",
+    "家醫收案會員ID",
+)
+DATE_HEADERS = ("看診日期", "看診日", "就診日期", "就診日", "就醫日期", "日期")
+AMOUNT_HEADERS = ("申請金額", "申請額", "總額", "費用", "申報總金額")
 MEMBER_FIELDS = {
     "case_category":            ("個案類別",),
     "quality_roster":           ("論質名單",),
@@ -66,7 +73,7 @@ MEMBER_FIELDS = {
     "hyperglycemia":            ("高血糖",),
 }
 MONTH_CODE_RE = re.compile(r"(?<!\d)(1(?:14|15)(?:0[1-9]|1[0-2]))(?!\d)")
-TW_ID_RE      = re.compile(r"[A-Z][12]\d{8}")
+TW_ID_RE      = re.compile(r"(?:[A-Z][1289]\d{8}|[A-Z][A-D]\d{8})")
 XLSX_SUFFIXES = {".xlsx", ".xlsm"}
 SCREENING_FILENAME_MAP = {
     "65歲以上老人": "老人流感",
@@ -80,14 +87,19 @@ SCREENING_FILENAME_MAP = {
 
 
 # ── 工具函式 ──────────────────────────────────────────────────────────────────
+def _compact_header(value: Any) -> str:
+    return re.sub(r"[\s　]+", "", normalize_text(value)).upper()
+
+
 def _header_map(values: Sequence[Any]) -> Dict[str, int]:
-    return {normalize_text(v): i for i, v in enumerate(values) if normalize_text(v)}
+    return {_compact_header(v): i for i, v in enumerate(values) if normalize_text(v)}
 
 
 def _find_col(headers: Dict[str, int], aliases: Iterable[str]) -> Optional[int]:
     for a in aliases:
-        if a in headers:
-            return headers[a]
+        key = _compact_header(a)
+        if key in headers:
+            return headers[key]
     return None
 
 
@@ -123,6 +135,18 @@ def _screening_type(path: Path) -> Optional[str]:
         if keyword.lower() in lower:
             return value
     return None
+
+
+def _normalize_lab_test_code(value: str) -> str:
+    text = normalize_text(value)
+    upper = text.upper()
+    if "HBA1C" in upper:
+        return "HbA1c"
+    if "LDL" in upper:
+        return "LDL"
+    if "UACR" in upper:
+        return "UACR"
+    return text
 
 
 def _trace(
@@ -179,6 +203,11 @@ class HongchengParser:
         # 2. 次數 PDF 與費用 xlsx → monthly_claims（聚合）
         pdf_dir = source_dir / "次數"
         pdf_files = sorted(pdf_dir.glob("*.pdf")) if pdf_dir.is_dir() else []
+        count_xlsx_files = sorted(
+            p for p in pdf_dir.glob("*.xlsx")
+            if not p.name.startswith(("~$", "."))
+            and _month_code(p.stem) is not None
+        ) if pdf_dir.is_dir() else []
         pdf_counts: Dict[str, Dict[str, Tuple[int, str, Path, int, str]]] = {}
         for path in pdf_files:
             code = _month_code(path.stem)
@@ -186,6 +215,17 @@ class HongchengParser:
                 continue
             rows = self._parse_pdf_counts(path)
             pdf_counts[code] = rows
+            coverage.parsed_files += 1
+            coverage.parsed_rows["monthly_visit_counts"] = (
+                coverage.parsed_rows.get("monthly_visit_counts", 0) + len(rows)
+            )
+        xlsx_counts: Dict[str, Dict[str, Tuple[int, Optional[Any], Path, int, Sequence[Any]]]] = {}
+        for path in count_xlsx_files:
+            code = _month_code(path.stem)
+            if code is None:
+                continue
+            rows = self._parse_count_workbook(path)
+            xlsx_counts[code] = rows
             coverage.parsed_files += 1
             coverage.parsed_rows["monthly_visit_counts"] = (
                 coverage.parsed_rows.get("monthly_visit_counts", 0) + len(rows)
@@ -202,7 +242,9 @@ class HongchengParser:
         for path in fee_files:
             parsed, unmatched, fee_fallback, count_differences = self._parse_fee_workbook(
                 source_dir, path, config, batch_id, existing_ids,
-                pdf_counts.get(_month_code(path.stem) or "", {}), bundle)
+                pdf_counts.get(_month_code(path.stem) or "", {}),
+                xlsx_counts.get(_month_code(path.stem) or "", {}),
+                bundle)
             if parsed or unmatched:
                 coverage.parsed_files += 1
                 coverage.parsed_rows["monthly_claims"] = (
@@ -283,13 +325,19 @@ class HongchengParser:
         for path in health_files:
             n = auxiliary._parse_health_mgmt(
                 source_dir, path, config, batch_id, bundle)
+            if n:
+                start = len(bundle.lab_results) - n
+                bundle.lab_results[start:] = [
+                    replace(rec, test_code=_normalize_lab_test_code(rec.test_code))
+                    for rec in bundle.lab_results[start:]
+                ]
             coverage.parsed_files += 1
             coverage.parsed_rows["lab_results"] = (
                 coverage.parsed_rows.get("lab_results", 0) + n)
 
         # 5. 跳過
         parsed_paths: Set[Path] = set(
-            roster_files + fee_files + pdf_files + select_files + exclude_files
+            roster_files + fee_files + pdf_files + count_xlsx_files + select_files + exclude_files
             + p4p_case_files + p4p_track_files + screening_files + health_files
         )
         for p in files:
@@ -420,6 +468,41 @@ class HongchengParser:
                 rows[chart_no] = (count, name, path, source_row, raw_line)
         return rows
 
+    @staticmethod
+    def _parse_count_workbook(
+        path: Path,
+    ) -> Dict[str, Tuple[int, Optional[Any], Path, int, Sequence[Any]]]:
+        rows: Dict[str, Tuple[int, Optional[Any], Path, int, Sequence[Any]]] = {}
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            ws = wb.worksheets[0]
+            header_row = _find_header_row(ws, (ID_HEADERS, DATE_HEADERS))
+            if header_row is None:
+                return rows
+            hvals = [ws.cell(header_row, c).value for c in range(1, ws.max_column + 1)]
+            hmap = _header_map(hvals)
+            id_col = _find_col(hmap, ID_HEADERS)
+            date_col = _find_col(hmap, DATE_HEADERS)
+            if id_col is None:
+                return rows
+            for row_no, vals in enumerate(
+                ws.iter_rows(min_row=header_row + 1, values_only=True),
+                start=header_row + 1,
+            ):
+                pid = normalize_id(vals[id_col])
+                if not TW_ID_RE.fullmatch(pid):
+                    continue
+                vdate = parse_date(vals[date_col]) if date_col is not None else None
+                count, old_date, _, first_row, first_vals = rows.get(
+                    pid, (0, None, path, row_no, vals)
+                )
+                if vdate and (old_date is None or vdate > old_date):
+                    old_date = vdate
+                rows[pid] = (count + 1, old_date, path, first_row, first_vals)
+        finally:
+            wb.close()
+        return rows
+
     # ── 照護名單 ──────────────────────────────────────────────────────────────
     def _parse_member_workbook(
         self,
@@ -480,6 +563,7 @@ class HongchengParser:
         config: ClinicConfig, batch_id: str,
         existing_ids: set,
         pdf_counts: Dict[str, Tuple[int, str, Path, int, str]],
+        xlsx_counts: Dict[str, Tuple[int, Optional[Any], Path, int, Sequence[Any]]],
         bundle: DatasetBundle,
     ) -> Tuple[int, int, int, int]:
         code = _month_code(path.stem) or _month_code(path.name)
@@ -492,14 +576,14 @@ class HongchengParser:
         parsed = unmatched = fee_fallback = count_differences = 0
         try:
             ws = wb.worksheets[0]
-            header_row = _find_header_row(ws, (ID_HEADERS, ("申請金額", "看診日期")))
+            header_row = _find_header_row(ws, (ID_HEADERS, AMOUNT_HEADERS, DATE_HEADERS))
             if header_row is None:
                 return 0, 0, 0, 0
             hvals = [ws.cell(header_row, c).value for c in range(1, ws.max_column + 1)]
             hmap      = _header_map(hvals)
             id_col    = _find_col(hmap, ID_HEADERS)
-            amount_col = _find_col(hmap, ("申請金額", "總額", "費用"))
-            date_col   = _find_col(hmap, ("看診日期", "日期", "就醫日期"))
+            amount_col = _find_col(hmap, AMOUNT_HEADERS)
+            date_col   = _find_col(hmap, DATE_HEADERS)
             chart_col  = _find_col(hmap, ("病歷號", "病歷號碼"))
             if id_col is None:
                 return 0, 0, 0, 0
@@ -533,11 +617,20 @@ class HongchengParser:
                 if pid not in existing_ids:
                     unmatched += 1
                 pdf_row = pdf_counts.get(rec["chart_no"])
-                visit_count = pdf_row[0] if pdf_row is not None else rec["count"]
-                if pdf_row is None:
+                xlsx_row = xlsx_counts.get(pid)
+                visit_count = rec["count"]
+                if pdf_row is not None:
+                    visit_count = pdf_row[0]
+                elif xlsx_row is not None:
+                    visit_count = xlsx_row[0]
+                if pdf_row is None and xlsx_row is None:
                     fee_fallback += 1
-                elif pdf_row[0] != rec["count"]:
+                elif visit_count != rec["count"]:
                     count_differences += 1
+                if xlsx_row is not None and xlsx_row[1] and (
+                    rec["last_visit"] is None or xlsx_row[1] > rec["last_visit"]
+                ):
+                    rec["last_visit"] = xlsx_row[1]
                 trace = _trace(
                     config, batch_id, source_dir, path,
                     ws.title, row_no, rec["first_vals"] or [pid])
@@ -564,6 +657,24 @@ class HongchengParser:
                     visit_count=parse_decimal(visit_count),
                     amount=rec["amount"],
                     last_visit_date=rec["last_visit"],
+                ))
+                parsed += 1
+            for pid, xlsx_row in xlsx_counts.items():
+                if pid in agg:
+                    continue
+                if pid not in existing_ids:
+                    unmatched += 1
+                count, last_visit, count_path, row_no, vals = xlsx_row
+                bundle.monthly_claims.append(MonthlyClaimRecord(
+                    trace=_trace(
+                        config, batch_id, source_dir, count_path,
+                        ws.title, row_no, vals),
+                    person_id=pid,
+                    roc_year=roc_year,
+                    month=month,
+                    visit_count=parse_decimal(count),
+                    amount=parse_decimal(0),
+                    last_visit_date=last_visit,
                 ))
                 parsed += 1
         finally:

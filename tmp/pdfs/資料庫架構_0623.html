@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>clinic_merge 資料庫架構文件</title>
+<style>
+@page { size: A4; margin: 20mm 16mm; }
+body { font-family: -apple-system, BlinkMacSystemFont, "PingFang TC", "Heiti TC", "Noto Sans CJK TC", sans-serif; font-size: 12.5px; line-height: 1.55; color: #1f2933; }
+h1 { font-size: 25px; margin: 0 0 14px; padding-bottom: 8px; border-bottom: 2px solid #334e68; color:#102a43; }
+h2 { font-size: 18px; margin: 24px 0 8px; color:#243b53; break-after: avoid; }
+h3 { font-size: 14.5px; margin: 16px 0 6px; color:#334e68; break-after: avoid; }
+p { margin: 5px 0 8px; }
+ol, ul { margin: 5px 0 10px 22px; padding: 0; }
+li { margin: 2px 0; }
+code { font-family: Menlo, Consolas, "SFMono-Regular", monospace; background: #f0f4f8; padding: 1px 4px; border-radius: 3px; font-size: 11.5px; }
+pre { background: #f0f4f8; border: 1px solid #d9e2ec; border-radius: 6px; padding: 9px 11px; overflow-wrap: break-word; white-space: pre-wrap; font-size: 10.5px; line-height: 1.35; margin: 7px 0 12px; }
+pre code { background: transparent; padding: 0; }
+</style>
+</head><body>
+<h1>clinic_merge 資料庫架構文件</h1>
+<p>更新日期：2026-06-23</p>
+<p>專案位置：<code>/Users/thousand0001/PycharmProjects/clinic_merge</code></p>
+<h2>1. 架構定位</h2>
+<p>本專案目前有兩條流程：</p>
+<ol>
+<li>傳統 Excel 直產流程  </li>
+</ol>
+<p>   各診所 <code>前置清洗_*.py</code> → <code>選會員_共用核心_*.py</code> → 正式 Excel。</p>
+<ol>
+<li>資料庫旁路流程  </li>
+</ol>
+<p>   <code>db_pipeline</code> parser → <code>DatasetBundle</code> → PostgreSQL staging → 從 DB 取回 → 正式 Excel。</p>
+<p>資料庫旁路的目標是把各系統來源資料標準化後，寫入 PostgreSQL staging，保留來源檔、sheet、列號與 row hash，讓後續可以重產、稽核與追溯。</p>
+<h2>2. 主要模組</h2>
+<pre><code>db_pipeline/
+├── cli/
+│   ├── inventory.py   # 只讀盤點來源資料夾
+│   ├── parse.py       # 解析來源資料，不寫 DB
+│   ├── stage.py       # parse → validate → stage 寫入 DB
+│   ├── batches.py     # 查詢批次
+│   └── output.py      # 從 DB batch 產出 Excel
+│
+├── parsers/           # 各來源系統 parser
+├── datasets/          # 標準資料模型 DatasetBundle
+├── validation/        # 資料驗證
+├── storage/           # PostgreSQL staging 寫入
+├── providers/         # 從資料夾或 PostgreSQL 讀回 DatasetBundle
+└── output/            # DatasetBundle → 會員資料 dict</code></pre>
+<h2>3. 資料流</h2>
+<pre><code>來源資料夾
+  ↓
+Parser：耀聖 / 新耀聖 / 展望 / 醫聖 / 調和 / 宏誠 / 方鼎 / 杏翔...
+  ↓
+DatasetBundle
+  ↓
+ValidationReport
+  ↓
+PostgresStagingWriter
+  ↓
+PostgreSQL staging tables
+  ↓
+PostgresDataProvider
+  ↓
+DatasetBundle
+  ↓
+member_builder.build_from_bundle()
+  ↓
+資料庫輸出0601.py / 舊輸出器
+  ↓
+正式 Excel</code></pre>
+<h2>4. DB 連線設定</h2>
+<p>目前程式使用 <code>psql</code> subprocess，不依賴 <code>psycopg2</code>。</p>
+<p>環境變數：</p>
+<pre><code>CLINIC_PSQL          # psql 路徑，可選
+CLINIC_DB_HOST      # 預設 localhost
+CLINIC_DB_PORT      # 預設 5432
+CLINIC_DB_USER      # 預設 thousand0001
+CLINIC_DB_NAME      # 預設 clinic_merge
+CLINIC_DB_PASSWORD  # 密碼，寫入 PGPASSWORD</code></pre>
+<p>目前本機測試狀態：<code>localhost:5432</code> 連線被拒絕，代表 PostgreSQL 沒啟動或未開 TCP 連線。</p>
+<h2>5. 標準資料模型 DatasetBundle</h2>
+<p>來源檔經 parser 後會轉成 <code>DatasetBundle</code>。</p>
+<p>主要資料集：</p>
+<pre><code>members             # 照護名單 / 家醫會員
+monthly_claims      # 門診次數費用
+p4p_cases           # P4P 收案
+p4p_tracks          # P4P 追蹤
+lab_results         # 檢驗資料
+screenings          # 預防保健 / 篩檢資料
+member_selections   # 自選 / 不選 / 指定名單旗標
+raw_source_files    # 來源檔追蹤
+raw_source_rows     # 原始列追蹤</code></pre>
+<p>每筆標準資料都有 <code>SourceTrace</code>：</p>
+<pre><code>clinic_code
+batch_id
+source_system
+source_file
+source_sheet
+source_row
+raw_row_hash</code></pre>
+<p>這是資料庫流程的追溯核心。</p>
+<h2>6. staging_v1 草案 schema</h2>
+<p>檔案位置：</p>
+<pre><code>db_pipeline/storage/schema/001_staging_v1.sql</code></pre>
+<p>目前 README 註記：這是旁路 staging schema 草案，尚未確認已在正式 PostgreSQL 執行。</p>
+<h3>staging_v1.members</h3>
+<p>會員基本資料與疾病欄位。</p>
+<p>主欄位：</p>
+<pre><code>batch_id
+clinic_id
+clinic_code
+source_system
+person_id
+name
+birth_date
+sex
+phone
+mobile
+address
+case_category
+quality_roster
+multi_chronic_65
+high_visit
+chronic_mark
+non_chronic_mark
+same_clinic_previous_year
+disease_pattern
+ascvd
+three_highs
+hypertension
+hyperlipidemia
+hyperglycemia
+source_file
+source_sheet
+source_row
+raw_row_hash
+staged_at</code></pre>
+<p>唯一鍵：</p>
+<pre><code>batch_id, source_file, source_sheet, source_row, person_id</code></pre>
+<h3>staging_v1.monthly_claims</h3>
+<p>門診次數與費用。</p>
+<p>主欄位：</p>
+<pre><code>batch_id
+clinic_id
+clinic_code
+source_system
+person_id
+roc_year       # 114 或 115
+month          # 1~12
+visit_count
+amount
+last_visit_date
+source_file
+source_sheet
+source_row
+raw_row_hash
+staged_at</code></pre>
+<p>唯一鍵：</p>
+<pre><code>batch_id, source_file, source_sheet, source_row, person_id, roc_year, month</code></pre>
+<h3>staging_v1.p4p_cases</h3>
+<p>P4P 收案資料。</p>
+<pre><code>person_id
+plan
+status
+enrolled_at
+source trace...</code></pre>
+<h3>staging_v1.p4p_tracks</h3>
+<p>P4P 追蹤資料。</p>
+<pre><code>person_id
+plan
+last_tracked_at
+next_track_at
+overdue
+source trace...</code></pre>
+<h3>staging_v1.lab_results</h3>
+<p>檢驗資料。</p>
+<pre><code>person_id
+test_code
+result_value
+tested_at
+source trace...</code></pre>
+<p>目前輸出端支援：</p>
+<pre><code>HbA1c
+LDL
+UACR</code></pre>
+<h3>staging_v1.screenings</h3>
+<p>預防保健 / 篩檢資料。</p>
+<pre><code>person_id
+screening_type
+screened_at
+source trace...</code></pre>
+<p>目前輸出端支援：</p>
+<pre><code>成人健檢
+子宮抹片
+老人流感
+糞便潛血
+肝炎篩檢</code></pre>
+<h3>staging_v1.member_selections</h3>
+<p>會員選取旗標。</p>
+<pre><code>person_id
+selection_type
+source trace...</code></pre>
+<p>允許值：</p>
+<pre><code>designated_114
+self_selected_115
+excluded_115</code></pre>
+<h3>staging_v1.validation_issues</h3>
+<p>驗證問題紀錄。</p>
+<pre><code>severity       # error / warning / info
+dataset_name
+issue_code
+message
+source_file
+source_sheet
+source_row
+created_at</code></pre>
+<h2>7. meta.batch_source_files</h2>
+<p>檔案位置：</p>
+<pre><code>db_pipeline/storage/schema/002_batch_source_files.sql</code></pre>
+<p>用途：記錄每個批次引用哪些來源檔案。</p>
+<pre><code>meta.batch_source_files
+├── batch_id
+└── source_file_id</code></pre>
+<p>主鍵：</p>
+<pre><code>batch_id, source_file_id</code></pre>
+<p>用途說明：</p>
+<ul>
+<li><code>meta.source_files.batch_id</code> 只代表首次引入批次。</li>
+<li><code>meta.batch_source_files</code> 才能表示每個 batch 實際引用了哪些來源檔。</li>
+</ul>
+<h2>8. 現況重要差異</h2>
+<p>目前有一個需要注意的架構落差：</p>
+<p><code>001_staging_v1.sql</code> 建立的是：</p>
+<pre><code>staging_v1.members
+staging_v1.monthly_claims
+staging_v1.p4p_cases
+staging_v1.p4p_tracks
+staging_v1.lab_results
+staging_v1.screenings
+staging_v1.member_selections</code></pre>
+<p>但目前 <code>db_pipeline/storage/__init__.py</code> 實際寫入的是：</p>
+<pre><code>staging.members
+staging.claims
+staging.member_flags
+staging.p4p_records
+staging.screenings
+staging.lab_results</code></pre>
+<p>而 <code>PostgresDataProvider</code> 讀回時也使用：</p>
+<pre><code>staging.members
+staging.claims
+staging.member_flags
+staging.p4p_records
+staging.screenings
+staging.lab_results</code></pre>
+<p>也就是說：</p>
+<pre><code>schema 草案：staging_v1.*
+目前程式：staging.*</code></pre>
+<p>這兩者尚未完全對齊。若要正式整理 DB 流程，這是第一個需要決定的架構點：</p>
+<ol>
+<li>將程式改成使用 <code>staging_v1.*</code></li>
+<li>或補正式 <code>staging.*</code> schema 文件</li>
+<li>或建立 view / alias 讓兩者相容</li>
+</ol>
+<h2>9. parser 支援現況</h2>
+<p>目前 parser registry 支援：</p>
+<pre><code>sm              # 耀聖
+new_sm          # 新耀聖
+prospect        # 展望
+medical_saint   # 醫聖
+tiaohe          # 調和
+hongcheng       # 宏誠
+custom          # 自行系統
+fangding        # 方鼎
+xingxiang       # 杏翔</code></pre>
+<p>近期檢查發現：</p>
+<ul>
+<li>耀聖 DB parser 目前尚未解析 <code>預防保健.CSV</code></li>
+<li>所以耀聖若走 DB 流程，<code>screenings</code> 會是 0</li>
+<li>但 DB 後段與輸出端本身已支援五項預防保健欄位</li>
+</ul>
+<h2>10. 輸出欄位對應</h2>
+<p><code>db_pipeline/output/member_builder.py</code> 會把 <code>DatasetBundle</code> 轉成舊輸出器可用的 member dict。</p>
+<h3>門診次數費用</h3>
+<pre><code>114_count_q1      # 114 年前 4 個月次數
+114_count         # 114 年全年次數
+114_amount        # 114 年費用總額
+115_count         # 115 年次數
+115_amount        # 115 年費用總額
+114_avg_amount    # 114 年月平均費用
+115_avg_amount    # 115 年月平均費用
+last_visit        # 最後就診日</code></pre>
+<h3>名單旗標</h3>
+<pre><code>designated_114     → designated / is_114_member
+self_selected_115  → self_select
+excluded_115x      → exclude_select</code></pre>
+<p>注意：目前 <code>member_builder</code> 接受 <code>excluded_115x</code>，但 <code>staging_v1.member_selections</code> 草案允許值是 <code>excluded_115</code>，命名也需要統一。</p>
+<h3>檢驗</h3>
+<pre><code>HbA1c → hba1c / hba1c_date
+LDL   → ldl / ldl_date
+UACR  → uacr / uacr_date</code></pre>
+<h3>篩檢</h3>
+<pre><code>成人健檢   → adult
+子宮抹片   → pap
+老人流感   → flu
+糞便潛血   → fit
+肝炎篩檢   → bc</code></pre>
+<h2>11. 建議下一步</h2>
+<p>若要讓資料庫流程穩定正式化，建議依序處理：</p>
+<ol>
+<li>決定正式 schema 名稱：<code>staging</code> 或 <code>staging_v1</code></li>
+<li>對齊 schema 欄位與程式欄位名稱</li>
+<li>統一 <code>member_selection</code> 的旗標命名</li>
+<li>補耀聖 <code>預防保健.CSV</code> → <code>ScreeningRecord</code></li>
+<li>補新式 / 舊式外來人口統一證號 ID 規則</li>
+<li>補電話正規化規則</li>
+<li>建立資料庫 migration 執行文件</li>
+<li>建立最小驗證 SQL：</li>
+</ol>
+<p>   - 批次筆數</p>
+<p>   - 會員筆數</p>
+<p>   - claims L/M/N/O 加總</p>
+<p>   - screenings 五項命中數</p>
+<p>   - E1/E2/E1/E2 重疊數</p>
+<h2>12. 目前檢查限制</h2>
+<p>本文件依據專案內現有程式與 SQL schema 檔整理。</p>
+<p>本機 PostgreSQL 目前無法連線，因此尚未核對實體資料庫內實際 schema。</p>
+</body></html>

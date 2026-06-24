@@ -28,7 +28,26 @@ import xlrd
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-TEMPLATE_PATH = PROJECT_DIR / "選會員模板0430.xlsx"
+
+
+def _project_file_version_key(path: Path) -> Tuple[int, ...]:
+    numbers = re.findall(r"\d+", path.stem)
+    return tuple(int(number) for number in numbers) if numbers else (0,)
+
+
+def _find_latest_project_file(pattern: str, description: str) -> Path:
+    candidates = sorted(
+        PROJECT_DIR.glob(pattern),
+        key=_project_file_version_key,
+        reverse=True,
+    )
+    if not candidates:
+        raise RuntimeError(f"找不到{description}：{pattern}")
+    return candidates[0]
+
+
+COMMON_CORE_PATH = _find_latest_project_file("選會員_共用核心_*.py", "共用核心")
+TEMPLATE_PATH = _find_latest_project_file("選會員模板*.xlsx", "選會員模板")
 
 CLINICS = {
     "zheng": {
@@ -522,10 +541,10 @@ def prepare_clinic_data(key: str, source_dir: Path, tmp_root: Path) -> Dict[str,
 
 
 def run_common_output(clean_dir: Path, output_dir: Path) -> Path:
-    generic_script = PROJECT_DIR / "選會員_共用核心_0605.py"
+    generic_script = COMMON_CORE_PATH
     if not generic_script.is_file():
         raise RuntimeError(f"找不到通用程式：{generic_script}")
-    spec = importlib.util.spec_from_file_location("run_merge_generic_0605", generic_script)
+    spec = importlib.util.spec_from_file_location("run_merge_generic_latest", generic_script)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"無法載入通用程式：{generic_script}")
     generic = importlib.util.module_from_spec(spec)
