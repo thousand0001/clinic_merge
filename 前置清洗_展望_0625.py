@@ -158,6 +158,17 @@ def _find_col(header: Iterable[Any], aliases: Iterable[str]) -> Optional[int]:
     return None
 
 
+def _find_new_prevention_header(ws: Any) -> Optional[Tuple[int, List[Any]]]:
+    id_aliases = ("身分證", "身分證號", "身分證號碼", "身份證", "身份證號", "身份證號碼", "ID")
+    date_aliases = ("看診日期", "看診日", "就診日", "日期")
+    max_row = min(ws.max_row or 0, 10)
+    for row_index in range(1, max_row + 1):
+        header = [cell.value for cell in ws[row_index]]
+        if _find_col(header, id_aliases) is not None and _find_col(header, date_aliases) is not None:
+            return row_index, header
+    return None
+
+
 def _classify_new_prevention_file(path: Path) -> Tuple[str, ...]:
     token = _normalize_filename_token(path.stem)
     if "cliscores" in token:
@@ -192,11 +203,10 @@ def _collect_new_prevention_rows(source_dir: Path) -> Dict[str, Dict[str, Tuple[
             continue
         try:
             for ws in wb.worksheets:
-                rows = ws.iter_rows(values_only=True)
-                try:
-                    header = list(next(rows))
-                except StopIteration:
+                header_info = _find_new_prevention_header(ws)
+                if header_info is None:
                     continue
+                header_row, header = header_info
                 id_col = _find_col(header, ("身分證", "身分證號", "身分證號碼", "身份證", "身份證號", "身份證號碼", "ID"))
                 name_col = _find_col(header, ("姓名", "病患姓名", "會員姓名"))
                 bday_col = _find_col(header, ("生日", "出生日期", "BIRTHDAY"))
@@ -204,7 +214,7 @@ def _collect_new_prevention_rows(source_dir: Path) -> Dict[str, Dict[str, Tuple[
                 if id_col is None or date_col is None:
                     continue
                 max_col = max(col for col in (id_col, name_col, bday_col, date_col) if col is not None)
-                for row in rows:
+                for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
                     if len(row) <= max_col:
                         continue
                     pid = GENERIC.normalize_id(row[id_col])
@@ -365,6 +375,56 @@ def patch_doctor_sheet(wb_tpl, details: Dict[str, Dict[str, Any]]) -> None:
     print(f"醫生看 AW~BI：依標準欄位補入 {extra_filled_rows} 列；AR/AS/BJ 已補算", flush=True)
 
 
+def patch_doctor_month_headers(wb_tpl, claim_months_115: Optional[List[int]]) -> None:
+    if GENERIC.DOCTOR_SHEET_NAME not in wb_tpl.sheetnames:
+        return
+    months = sorted({month for month in (claim_months_115 or []) if 1 <= month <= 12})
+    ws_doc = wb_tpl[GENERIC.DOCTOR_SHEET_NAME]
+    if months:
+        month_text = GENERIC._format_month_span(months)
+        month_count = len(months)
+        ws_doc["N2"] = (
+            f"114年{month_text}\n同期月平均費用\n"
+            f"（同期總額 ÷ {month_count}）"
+        )
+        ws_doc["O2"] = (
+            f"115年{month_text}\n月平均費用\n"
+            f"（有效月份總額 ÷ {month_count}）"
+        )
+    else:
+        ws_doc["N2"] = "114年同期月平均費用\n（未偵測到115年有效月份）"
+
+
+def patch_main_114_avg_amount(
+    ws,
+    data_start: int,
+    last_row: int,
+    cols: Dict[str, Optional[int]],
+    claim_sums: Dict[str, Dict[str, float]],
+    meta: Optional[Dict[int, Any]] = None,
+) -> None:
+    col_bd = cols.get("avg_amount_114_hidden")
+    col_id = cols.get("id")
+    if not col_bd or not col_id:
+        return
+    ws.cell(1, col_bd).value = "114年同期月平均"
+    for row in range(data_start, last_row + 1):
+        pid = ""
+        if meta is not None:
+            member_meta = meta.get(row)
+            pid = GENERIC.normalize_text(getattr(member_meta, "pid", "")).upper() if member_meta is not None else ""
+        if not pid:
+            pid = GENERIC.normalize_text(ws.cell(row, col_id).value).upper()
+        bucket = claim_sums.get(pid)
+        if not bucket:
+            ws.cell(row, col_bd).value = None
+            continue
+        amount_114_same_months = float(bucket.get("114_amt", 0.0) or 0.0)
+        month_count = max(int(bucket.get("115_months", 0.0) or 0.0), 1)
+        avg_114 = amount_114_same_months / float(month_count) if amount_114_same_months else None
+        ws.cell(row, col_bd).value = GENERIC._to_excel_int(avg_114) if avg_114 is not None else None
+
+
 def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
     source_dir = Path(source_path).expanduser().resolve()
     if not source_dir.is_dir():
@@ -381,17 +441,41 @@ def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
 
         member_extra_details = collect_member_extra_details(temp_source)
         original_populate_doctor_sheet = GENERIC.populate_doctor_sheet
+        original_fill_monthly_claim_summary_columns = GENERIC.fill_monthly_claim_summary_columns
+        original_months_summary = GENERIC._format_115_months_summary
+
+        def fill_monthly_claim_summary_columns_with_prospect_avg(*args: Any, **kwargs: Any) -> None:
+            original_fill_monthly_claim_summary_columns(*args, **kwargs)
+            patch_main_114_avg_amount(*args, **kwargs)
 
         def populate_doctor_sheet_with_prospect_patch(*args: Any, **kwargs: Any) -> None:
             original_populate_doctor_sheet(*args, **kwargs)
             wb_tpl = args[0]
+            patch_doctor_month_headers(wb_tpl, kwargs.get("claim_months_115"))
             patch_doctor_sheet(wb_tpl, member_extra_details)
 
+        def format_months_summary_with_prospect_n(months: List[int]) -> str:
+            if not months:
+                return original_months_summary(months)
+            month_text = GENERIC._format_month_span(months)
+            month_count = len(months)
+            return (
+                f"115年有效月份：{month_text}，共{month_count}個月；"
+                f"醫生看 L 欄使用114年{month_text}同期次數，"
+                f"M 欄使用115年{month_text}次數，"
+                f"N 欄使用114年{month_text}同期總費用除以{month_count}，"
+                f"O 欄使用115年{month_text}總費用除以{month_count}。"
+            )
+
         GENERIC.populate_doctor_sheet = populate_doctor_sheet_with_prospect_patch
+        GENERIC.fill_monthly_claim_summary_columns = fill_monthly_claim_summary_columns_with_prospect_avg
+        GENERIC._format_115_months_summary = format_months_summary_with_prospect_n
         try:
             temp_output = Path(GENERIC.process_excel(str(temp_source), str(template)))
         finally:
             GENERIC.populate_doctor_sheet = original_populate_doctor_sheet
+            GENERIC.fill_monthly_claim_summary_columns = original_fill_monthly_claim_summary_columns
+            GENERIC._format_115_months_summary = original_months_summary
 
         final_output = source_dir.parent / temp_output.name
         if final_output.exists():

@@ -20,13 +20,16 @@ from __future__ import annotations
 
 import csv
 import datetime
+import gc
 import hashlib
 import importlib.util
+import getpass
 import os
 import re
 import shutil
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,6 +38,7 @@ from openpyxl import Workbook, load_workbook
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+LAST_RUN_NOTICE = ""
 
 SCREENING_CODE_MAP = {
     "IC3E": ("成人健檢",),
@@ -52,6 +56,40 @@ SCREENING_CODE_MAP = {
     "ICL1002": ("成人健檢", "肝炎篩檢"),
 }
 SCREENING_SHEETS = ("成人健檢", "子宮抹片", "糞便潛血", "老人流感", "肝炎篩檢")
+ZONGBEI_PASSWORD_HINT = "宗北加密 Excel 密碼"
+
+
+def _safe_move_excel(temp_output: Path, final_output: Path) -> Path:
+    """
+    Use copy instead of shutil.move on Windows.
+
+    shutil.move may copy successfully and then fail at os.unlink(src) when the
+    temp file is still locked, which raises WinError 32 even though the formal
+    output already exists. Copy first, then best-effort delete the temp file.
+    """
+    gc.collect()
+    final_output.parent.mkdir(parents=True, exist_ok=True)
+    target = final_output
+    if target.exists():
+        try:
+            target.unlink()
+        except PermissionError:
+            timestamp = datetime.datetime.now().strftime("%H%M%S")
+            target = target.with_name(f"{target.stem}_{timestamp}{target.suffix}")
+
+    for attempt in range(10):
+        try:
+            shutil.copy2(str(temp_output), str(target))
+            try:
+                temp_output.unlink()
+            except PermissionError:
+                print(f"  暫存檔仍被 Windows 鎖住，正式輸出已完成：{target}", flush=True)
+            return target
+        except PermissionError:
+            if attempt < 9:
+                time.sleep(0.8)
+            else:
+                raise
 HEPATITIS_LAB_CODES = {"L1001C", "L1002C"}
 
 
@@ -160,6 +198,248 @@ def _find_prevention_csv(source_dir: Path) -> Optional[Path]:
         if path.is_file():
             return path
     return None
+
+
+def _is_zongbei_source(source_dir: Path) -> bool:
+    name = source_dir.name
+    return "3501102622" in name or "宗北" in name
+
+
+def _is_ole_encrypted_excel(path: Path) -> bool:
+    try:
+        data = path.read_bytes()[:4096]
+    except OSError:
+        return False
+    if not data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return False
+    return b"encryption" in data.lower()
+
+
+def _find_unreadable_excel_like_files(source_dir: Path) -> List[Path]:
+    files: List[Path] = []
+    for path in sorted(source_dir.glob("*.xlsx")):
+        if path.name.startswith("~$"):
+            continue
+        if _is_ole_encrypted_excel(path):
+            files.append(path)
+    return files
+
+
+def _find_unreadable_prevention_files(source_dir: Path) -> List[Path]:
+    return [
+        path
+        for path in _find_unreadable_excel_like_files(source_dir)
+        if "預防保健" in path.name
+    ]
+
+
+def _write_empty_screening_workbook(out_dir: Path) -> Path:
+    """建立必要篩檢分頁，讓缺可讀預防保健檔的宗北流程可先完成。"""
+    output_path = out_dir / "耀聖_預防保健_空白.xlsx"
+    wb = Workbook()
+    wb.remove(wb.active)
+    for sheet_name in SCREENING_SHEETS:
+        ws = wb.create_sheet(sheet_name)
+        ws.append(["指標名稱", "ID", "生日", "姓名", "最後篩檢日期"])
+    wb.save(output_path)
+    wb.close()
+    return output_path
+
+
+def _write_internal_member_roster(
+    out_dir: Path,
+    identity_map: Dict[Tuple[str, str], str],
+    internal_ids: set[str],
+) -> int:
+    """宗北次數檔無 ID 時，補一份中間會員名單讓純次數人員不被漏掉。"""
+    if not internal_ids:
+        return 0
+    output_path = out_dir / "耀聖_內部ID會員補充.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "會員名單"
+    ws.append(["ID", "姓名", "BRITHDAY", "疾病樣態"])
+    count = 0
+    for (name, bday), pid in sorted(identity_map.items()):
+        if pid not in internal_ids:
+            continue
+        ws.append([pid, name, bday, ""])
+        count += 1
+    wb.save(output_path)
+    wb.close()
+    return count
+
+
+def _build_roster_birthday_map(source_dir: Path) -> Dict[str, str]:
+    """以家醫/較需要照護名單為準，建立 ID -> 生日。"""
+    result: Dict[str, str] = {}
+    id_cands = ("ID", "身分證號", "身份證號", "身分證號碼", "身份證號碼", "家醫收案會員ID")
+    bday_cands = ("BRITHDAY", "BIRTHDAY", "生日", "出生日期")
+
+    for path in sorted(source_dir.glob("*")):
+        if not path.is_file() or path.name.startswith("~$"):
+            continue
+        if "家醫" not in path.name and "照護名單" not in path.name and "會員名單" not in path.name:
+            continue
+
+        if path.suffix.lower() == ".csv":
+            rows = _read_csv_rows(path)
+            h = _find_header_row(rows, (id_cands, bday_cands), max_rows=10)
+            if h is None:
+                continue
+            id_col = _find_col(rows[h], id_cands)
+            bday_col = _find_col(rows[h], bday_cands)
+            if id_col is None or bday_col is None:
+                continue
+            for row in rows[h + 1:]:
+                pid = _valid_pid(row[id_col] if id_col < len(row) else "")
+                bday = _parse_date_iso(row[bday_col] if bday_col < len(row) else "")
+                if pid and bday:
+                    result[pid] = bday
+
+        elif path.suffix.lower() == ".xlsx":
+            try:
+                wb = load_workbook(path, read_only=True, data_only=True)
+            except Exception:
+                continue
+            try:
+                for ws in wb.worksheets:
+                    rows = [list(r) for r in ws.iter_rows(max_row=500, values_only=True)]
+                    h = _find_header_row(rows, (id_cands, bday_cands), max_rows=10)
+                    if h is None:
+                        continue
+                    id_col = _find_col(rows[h], id_cands)
+                    bday_col = _find_col(rows[h], bday_cands)
+                    if id_col is None or bday_col is None:
+                        continue
+                    for row in rows[h + 1:]:
+                        pid = _valid_pid(row[id_col] if id_col < len(row) else "")
+                        bday = _parse_date_iso(row[bday_col] if bday_col < len(row) else "")
+                        if pid and bday:
+                            result[pid] = bday
+            finally:
+                wb.close()
+    return result
+
+
+def _write_workbook_first_sheet_as_csv(xlsx_path: Path, csv_path: Path) -> int:
+    wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+    rows_written = 0
+    try:
+        ws = wb[wb.sheetnames[0]]
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            for row in ws.iter_rows(values_only=True):
+                writer.writerow(["" if v is None else v for v in row])
+                rows_written += 1
+        return rows_written
+    finally:
+        wb.close()
+
+
+def _decrypt_office_excel(path: Path, password: str, output_path: Path) -> None:
+    try:
+        import msoffcrypto
+    except ImportError as exc:
+        raise RuntimeError(
+            "宗北加密 Excel 需要 msoffcrypto-tool，請先安裝：python -m pip install msoffcrypto-tool"
+        ) from exc
+
+    with path.open("rb") as src, output_path.open("wb") as dst:
+        office_file = msoffcrypto.OfficeFile(src)
+        office_file.load_key(password=password)
+        office_file.decrypt(dst)
+
+
+def _ask_password_dialog(title: str, prompt: str) -> Optional[str]:
+    try:
+        import tkinter as tk
+        from tkinter import simpledialog
+    except Exception:
+        return None
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+        password = simpledialog.askstring(title, prompt, show="*", parent=root)
+        return password
+    finally:
+        root.destroy()
+
+
+def _get_encrypted_excel_password(
+    encrypted_files: List[Path],
+    provided_password: Optional[str] = None,
+    failed_file: Optional[Path] = None,
+) -> str:
+    if provided_password:
+        return provided_password
+    if failed_file is not None:
+        prompt = f"上一個密碼無法解開此檔案，請重新輸入密碼：\n\n{failed_file.name}"
+    else:
+        file_list = "\n".join(path.name for path in encrypted_files[:8])
+        extra = "\n..." if len(encrypted_files) > 8 else ""
+        prompt = (
+            "偵測到宗北加密 Excel，請輸入密碼：\n\n"
+            f"{file_list}{extra}"
+        )
+    password = _ask_password_dialog(ZONGBEI_PASSWORD_HINT, prompt)
+    if password:
+        return password
+    if sys.stdin is not None and sys.stdin.isatty():
+        if failed_file is not None:
+            password = getpass.getpass(f"請重新輸入 {failed_file.name} 的密碼：")
+        else:
+            password = getpass.getpass("請輸入宗北加密 Excel 密碼：")
+        if password:
+            return password
+    raise RuntimeError("未輸入宗北加密 Excel 密碼，無法解密預防保健/篩檢檔。")
+
+
+def _decrypt_zongbei_excel_files(
+    source_dir: Path,
+    provided_password: Optional[str] = None,
+) -> Tuple[List[Path], List[str]]:
+    decrypted: List[Path] = []
+    messages: List[str] = []
+    encrypted_files = _find_unreadable_excel_like_files(source_dir)
+    if not encrypted_files:
+        return decrypted, messages
+
+    password = _get_encrypted_excel_password(encrypted_files, provided_password)
+    for path in encrypted_files:
+        decrypted_path = path.with_name(f"{path.stem}_解密.xlsx")
+        for attempt in range(2):
+            try:
+                _decrypt_office_excel(path, password, decrypted_path)
+                break
+            except Exception as exc:
+                decrypted_path.unlink(missing_ok=True)
+                if attempt == 0 and provided_password is None:
+                    messages.append(f"{path.name} 使用前一個密碼解密失敗，改請使用者重新輸入。")
+                    password = _get_encrypted_excel_password(
+                        encrypted_files,
+                        provided_password=None,
+                        failed_file=path,
+                    )
+                    continue
+                messages.append(f"{path.name} 解密失敗：{exc}")
+                break
+        if not decrypted_path.exists():
+            continue
+
+        decrypted.append(decrypted_path)
+        messages.append(f"{path.name} → {decrypted_path.name}")
+
+        if "預防保健" in path.name:
+            csv_path = source_dir / "預防保健.CSV"
+            rows = _write_workbook_first_sheet_as_csv(decrypted_path, csv_path)
+            messages.append(f"{decrypted_path.name} → {csv_path.name}（{rows} 列）")
+            decrypted_path.unlink(missing_ok=True)
+
+        path.rename(path.with_name(f"{path.name}.encrypted"))
+    return decrypted, messages
 
 
 _ID_RE = re.compile(r"^[A-Z]{1,2}\d{8,9}$")
@@ -420,9 +700,9 @@ def _convert_prevention_csv(source_dir: Path, out_dir: Path) -> Dict[str, int]:
     wb.remove(wb.active)
     for sheet_name in SCREENING_SHEETS:
         ws = wb.create_sheet(sheet_name)
-        ws.append(["ID", "姓名", "生日", "最後篩檢日期"])
+        ws.append(["指標名稱", "ID", "生日", "姓名", "最後篩檢日期"])
         for pid, (last_date, name, bday) in sorted(screening[sheet_name].items()):
-            ws.append([pid, name, bday, last_date])
+            ws.append([sheet_name, pid, bday, name, last_date])
     wb.save(out_dir / "耀聖_預防保健_補正.xlsx")
     wb.close()
 
@@ -521,6 +801,7 @@ def _convert_last_visit_csv(
     for pid, (name, date) in sorted(latest.items()):
         ws.append([pid, name, date, 0, 0])
     wb.save(out_dir / "耀聖_最後就診日_補正.xlsx")
+    wb.close()
     print(f"  最後就診日：{len(latest)} 筆已補 ID，{unmatched} 筆找不到 ID", flush=True)
     last_visit_dict = {pid: date_iso for pid, (_, date_iso) in latest.items()}
     return len(latest), last_visit_dict
@@ -597,6 +878,7 @@ def _convert_count_csvs(
             for r in rows_out:
                 ws.append(r)
             wb.save(out_dir / f"耀聖_次數_{month_code}_補正.xlsx")
+            wb.close()
             total += len(rows_out)
             print(f"  次數 {month_code}：{len(rows_out)} 筆已補 ID", flush=True)
 
@@ -618,49 +900,50 @@ def _post_fill_last_visit(output_path: Path, last_visit_dict: Dict[str, str]) ->
 
     wb = load_workbook(output_path)
     changed = 0
+    try:
+        for ws in wb.worksheets:
+            id_col: Optional[int] = None
+            lv_col: Optional[int] = None
+            header_row: Optional[int] = None
 
-    for ws in wb.worksheets:
-        id_col: Optional[int] = None
-        lv_col: Optional[int] = None
-        header_row: Optional[int] = None
+            max_scan = min(10, ws.max_row or 0)
+            for row_idx in range(1, max_scan + 1):
+                cells = [
+                    str(ws.cell(row_idx, c).value or "").strip()
+                    for c in range(1, (ws.max_column or 0) + 1)
+                ]
+                if any(c in cells for c in _ID_CANDS_OUT) and "最後就診日" in cells:
+                    header_row = row_idx
+                    for col_idx, cell_val in enumerate(cells, start=1):
+                        if cell_val in _ID_CANDS_OUT and id_col is None:
+                            id_col = col_idx
+                        if cell_val == "最後就診日" and lv_col is None:
+                            lv_col = col_idx
+                    break
 
-        max_scan = min(10, ws.max_row or 0)
-        for row_idx in range(1, max_scan + 1):
-            cells = [
-                str(ws.cell(row_idx, c).value or "").strip()
-                for c in range(1, (ws.max_column or 0) + 1)
-            ]
-            if any(c in cells for c in _ID_CANDS_OUT) and "最後就診日" in cells:
-                header_row = row_idx
-                for col_idx, cell_val in enumerate(cells, start=1):
-                    if cell_val in _ID_CANDS_OUT and id_col is None:
-                        id_col = col_idx
-                    if cell_val == "最後就診日" and lv_col is None:
-                        lv_col = col_idx
-                break
-
-        if id_col is None or lv_col is None or header_row is None:
-            continue
-
-        for row_idx in range(header_row + 1, (ws.max_row or 0) + 1):
-            pid = str(ws.cell(row_idx, id_col).value or "").strip().upper()
-            if not pid or not _ID_RE.match(pid):
+            if id_col is None or lv_col is None or header_row is None:
                 continue
-            if pid not in last_visit_dict:
-                continue
-            lv_cell = ws.cell(row_idx, lv_col)
-            if lv_cell.value is not None:
-                continue
-            try:
-                lv_cell.value = datetime.date.fromisoformat(last_visit_dict[pid])
-                changed += 1
-            except ValueError:
-                pass
 
-    if changed:
-        wb.save(output_path)
-        print(f"  後處理補填最後就診日：{changed} 格（包含 ROC 113 / 2024 年份）", flush=True)
-    wb.close()
+            for row_idx in range(header_row + 1, (ws.max_row or 0) + 1):
+                pid = str(ws.cell(row_idx, id_col).value or "").strip().upper()
+                if not pid or not _ID_RE.match(pid):
+                    continue
+                if pid not in last_visit_dict:
+                    continue
+                lv_cell = ws.cell(row_idx, lv_col)
+                if lv_cell.value is not None:
+                    continue
+                try:
+                    lv_cell.value = datetime.date.fromisoformat(last_visit_dict[pid])
+                    changed += 1
+                except ValueError:
+                    pass
+
+        if changed:
+            wb.save(output_path)
+            print(f"  後處理補填最後就診日：{changed} 格（包含 ROC 113 / 2024 年份）", flush=True)
+    finally:
+        wb.close()
 
 
 def _blank_internal_ids(output_path: Path, internal_ids: set[str]) -> int:
@@ -744,9 +1027,107 @@ def _post_fill_main_dx(output_path: Path, source_dir: Path) -> int:
         wb.close()
 
 
+def _collect_count_totals_by_person(source_dir: Path) -> Dict[Tuple[str, str], List[float]]:
+    count_dir = source_dir / "次數"
+    totals: Dict[Tuple[str, str], List[float]] = {}
+    if not count_dir.is_dir():
+        return totals
+
+    for csv_path in sorted(list(count_dir.glob("*.CSV")) + list(count_dir.glob("*.csv"))):
+        m = re.fullmatch(r"(1(?:14|15)\d{2})(?:_Big5)?", csv_path.stem, re.IGNORECASE)
+        if not m:
+            continue
+        month_code = m.group(1)
+        year_idx = 0 if month_code.startswith("114") else 1
+        rows = _read_csv_rows(csv_path)
+        h = _find_header_row(rows, (("姓名", "姓    名", "病患姓名"), ("生日", "生   日"), ("次數",)))
+        if h is None:
+            continue
+        name_col = _find_col(rows[h], ("姓名", "姓    名", "病患姓名"))
+        bday_col = _find_col(rows[h], ("生日", "生   日"))
+        count_col = _find_col(rows[h], ("次數",))
+        if name_col is None or bday_col is None or count_col is None:
+            continue
+        for row in rows[h + 1:]:
+            name = _normalize_name(row[name_col] if name_col < len(row) else "")
+            bday = _parse_date_iso(row[bday_col] if bday_col < len(row) else "")
+            if not name or not bday:
+                continue
+            try:
+                cnt = float(str(row[count_col] if count_col < len(row) else 0).replace(",", "") or 0)
+            except (ValueError, TypeError):
+                cnt = 0.0
+            bucket = totals.setdefault((name, bday), [0.0, 0.0])
+            bucket[year_idx] += cnt
+    return totals
+
+
+def _collect_output_count_totals_by_person(output_path: Path) -> Dict[Tuple[str, str], List[float]]:
+    totals: Dict[Tuple[str, str], List[float]] = {}
+    wb = load_workbook(output_path, read_only=True, data_only=True)
+    try:
+        if "會員總表" not in wb.sheetnames:
+            return totals
+        ws = wb["會員總表"]
+        for row in ws.iter_rows(min_row=3, min_col=1, max_col=14, values_only=True):
+            if not any(v not in (None, "") for v in row):
+                continue
+            name = _normalize_name(row[0] if len(row) > 0 else "")
+            bday = _parse_date_iso(row[6] if len(row) > 6 else "")
+            if not name or not bday:
+                continue
+            bucket = totals.setdefault((name, bday), [0.0, 0.0])
+            for idx, pos in enumerate((11, 13)):
+                try:
+                    bucket[idx] += float(str(row[pos] if len(row) > pos else 0).replace(",", "") or 0)
+                except (ValueError, TypeError):
+                    pass
+        return totals
+    finally:
+        wb.close()
+
+
+def _build_zongbei_missing_count_message(output_path: Path, source_dir: Path) -> str:
+    expected = _collect_count_totals_by_person(source_dir)
+    actual = _collect_output_count_totals_by_person(output_path)
+    missing: List[Tuple[str, str, float, float, str]] = []
+
+    for key, counts in sorted(expected.items()):
+        actual_counts = actual.get(key, [0.0, 0.0])
+        if actual_counts == counts:
+            continue
+        diff_114 = max(counts[0] - actual_counts[0], 0.0)
+        diff_115 = max(counts[1] - actual_counts[1], 0.0)
+        if diff_114 == 0 and diff_115 == 0:
+            continue
+        name, bday = key
+        reason = "次數檔生日與會員總表生日不一致，不併入總表"
+        missing.append((name, bday, diff_114, diff_115, reason))
+
+    if not missing:
+        return ""
+
+    lines = [
+        "宗北未入總表資料：",
+        f"  未入總表人數：{len(missing)}",
+        f"  114年未入次數合計：{sum(row[2] for row in missing):g}",
+        f"  115年未入次數合計：{sum(row[3] for row in missing):g}",
+        "  明細：",
+    ]
+    for name, bday, cnt_114, cnt_115, reason in missing:
+        lines.append(f"    {name} / {bday} / 114={cnt_114:g} / 115={cnt_115:g} / {reason}")
+    return "\n".join(lines)
+
+
 # ─── 主流程 ──────────────────────────────────────────────────────────────────
 
-def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
+def process_excel(
+    source_path: str,
+    template_path: Optional[str] = None,
+    encrypted_excel_password: Optional[str] = None,
+) -> str:
+    global LAST_RUN_NOTICE
+    LAST_RUN_NOTICE = ""
     generic    = _load_generic_module()
     source_dir = Path(source_path).resolve()
     if not source_dir.is_dir():
@@ -762,12 +1143,28 @@ def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
     try:
         shutil.copytree(source_dir, temp_source)
 
+        is_zongbei = _is_zongbei_source(source_dir)
+        if is_zongbei:
+            decrypted_paths, decrypt_messages = _decrypt_zongbei_excel_files(
+                temp_source,
+                encrypted_excel_password,
+            )
+            if decrypt_messages:
+                print("  宗北加密 Excel 解密：", flush=True)
+                for message in decrypt_messages:
+                    print(f"    {message}", flush=True)
+            birthday_map = _build_roster_birthday_map(temp_source)
+            if birthday_map:
+                print(f"  宗北家醫/會員名單生日基準：{len(birthday_map)} 筆", flush=True)
+
         has_last_visit = bool(
             list(temp_source.glob("最後就診日*.CSV")) or
             list(temp_source.glob("最後就診日*.csv"))
         )
         has_count_dir = (temp_source / "次數").is_dir()
         has_prevention = _find_prevention_csv(temp_source) is not None
+        unreadable_excel_files = _find_unreadable_excel_like_files(temp_source)
+        unreadable_prevention_files = _find_unreadable_prevention_files(temp_source)
 
         matched = 0
         last_visit_dict: Dict[str, str] = {}
@@ -781,6 +1178,9 @@ def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
             internal_ids = _extend_identity_map_with_internal_ids(temp_source, identity_map)
             if internal_ids:
                 print(f"  無真實 ID，暫以內部 ID 串接：{len(internal_ids)} 人", flush=True)
+                if is_zongbei:
+                    roster_count = _write_internal_member_roster(temp_source, identity_map, internal_ids)
+                    print(f"  宗北純次數會員補充：{roster_count} 人", flush=True)
             print(f"  對照表：{len(identity_map)} 筆", flush=True)
             if has_prevention:
                 prevention_stats = _convert_prevention_csv(temp_source, temp_source)
@@ -802,6 +1202,20 @@ def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
                 matched += count
             if has_count_dir:
                 matched += _convert_count_csvs(temp_source, identity_map, temp_source)
+        if is_zongbei and not has_prevention and unreadable_prevention_files:
+            _write_empty_screening_workbook(temp_source)
+            print(
+                "  宗北預防保健檔無法由 Python 讀取，已建立空白篩檢分頁讓流程先完成；"
+                "下列預防保健資料未吃到，需用 Excel 另存成標準 xlsx/csv 後重跑："
+                + "、".join(path.name for path in unreadable_prevention_files),
+                flush=True,
+            )
+        if unreadable_excel_files:
+            print(
+                "  偵測到加密或非標準 xlsx，已略過原始加密檔："
+                + "、".join(path.name for path in unreadable_excel_files),
+                flush=True,
+            )
         print(f"前置清洗完成，補正 {matched} 筆", flush=True)
 
         temp_output = Path(generic.process_excel(str(temp_source), template))
@@ -813,9 +1227,11 @@ def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
         if blanked_ids:
             print(f"  已清空暫時內部 ID：{blanked_ids} 格", flush=True)
         final_output = source_dir.parent / temp_output.name
-        if final_output.exists():
-            final_output.unlink()
-        shutil.move(str(temp_output), str(final_output))
+        final_output = _safe_move_excel(temp_output, final_output)
+        if is_zongbei:
+            LAST_RUN_NOTICE = _build_zongbei_missing_count_message(final_output, source_dir)
+            if LAST_RUN_NOTICE:
+                print(LAST_RUN_NOTICE, flush=True)
         return str(final_output)
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
@@ -825,6 +1241,14 @@ def process_excel(source_path: str, template_path: Optional[str] = None) -> str:
 
 def main() -> None:
     generic = _load_generic_module()
+    if len(sys.argv) > 1:
+        src = sys.argv[1]
+        template = sys.argv[2] if len(sys.argv) > 2 else generic._find_template(str(SCRIPT_DIR))
+        password = sys.argv[3] if len(sys.argv) > 3 else None
+        out = process_excel(src, template, password)
+        print(f"已輸出：{out}", flush=True)
+        return
+
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
@@ -839,7 +1263,8 @@ def main() -> None:
 
     try:
         out = process_excel(src, template)
-        messagebox.showinfo("完成", f"已輸出：\n{out}")
+        notice = f"\n\n{LAST_RUN_NOTICE}" if LAST_RUN_NOTICE else ""
+        messagebox.showinfo("完成", f"已輸出：\n{out}{notice}")
         generic.open_file_cross_platform(out)
     except Exception as e:
         traceback.print_exc()
